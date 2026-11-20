@@ -309,6 +309,10 @@ import {
   getFriendlyBreakUsage,
   getFriendlyCooldownSummary,
   getInterviewCooldownSummary,
+  getNtFriendlyAdSummary,
+  spendNtFriendlyAds,
+  refundNtFriendlyAds,
+  NT_FRIENDLY_REQUIRED_ADS,
   getNationalProposals,
   linkTelegramToClub,
   recordInterviewAdCooldown,
@@ -6847,7 +6851,64 @@ var POSES = Object.keys(GROUP);
 function rosterOf(tid) {
   return db.players.filter((p) => p.teamId === tid);
 }
+/* ───────── Сборная России / U21 как соперник в товарищеских матчах ─────────
+   Виртуальные «клубы» tm_nt_main / tm_nt_u21 не имеют собственных игроков: их состав — это вызванные
+   в сборную игроки клубов (nt.current.final, а если финальный список пуст — расширенный).
+   Пока игрок вызван (даты паузы, где у сборной есть матчи), он недоступен своему клубу
+   во ВСЕХ матчах (в т.ч. товарищеских с другими клубами и со сборной) и играет только за сборную. */
+var NT_TID = { main: "tm_nt_main", u21: "tm_nt_u21" };
+function ntTypeOfTid(tid) {
+  return tid === NT_TID.main ? "main" : tid === NT_TID.u21 ? "u21" : null;
+}
+function ensureNtTeams() {
+  let ch = false;
+  const defs: [string, string][] = [["main", "Сборная России"], ["u21", "Сборная России U21"]];
+  for (const [type, name] of defs) {
+    const id = NT_TID[type];
+    let t = db.teams.find((x) => x.id === id);
+    if (!t) {
+      t = { id, name, comp: "friendly", city: "Москва", country: "Россия", lat: null, lon: null, stadium: "", logo: "/assets/aistudio/russia_russia-national-team.football-logos.cc_2a5e3ddc.svg", national: type };
+      db.teams.push(t);
+      ch = true;
+    } else if (t.national !== type) {
+      t.national = type;
+      ch = true;
+    }
+  }
+  return ch;
+}
+function ntCurrent(type) {
+  return type === "u21" ? db?.nationalTeamU21?.current : db?.nationalTeam?.current;
+}
+function ntActiveIds(type) {
+  const c = ntCurrent(type) || {};
+  const fin = Array.isArray(c.final) ? c.final : [];
+  const ext = Array.isArray(c.extended) ? c.extended : [];
+  return fin.length ? fin : ext;
+}
+function ntBreakOf(date) {
+  if (!date) return null;
+  return (db.internationalBreaks || DEFAULT_INTERNATIONAL_BREAKS).find((b) => String(b.id).startsWith("ib_") && date >= b.start && date <= b.end) || null;
+}
+function ntBreakHasMatches(type, brk) {
+  if (!brk) return false;
+  return ((ntCurrent(type)?.matches) || []).some((m) => {
+    const d = m.gameDate || m.date;
+    return d && d >= brk.start && d <= brk.end;
+  });
+}
+function ntCalledUpTypeOn(pid, date) {
+  if (!date || !db || !pid) return null;
+  const b = ntBreakOf(date);
+  if (!b) return null;
+  for (const type of ["main", "u21"]) {
+    if (ntBreakHasMatches(type, b) && ntActiveIds(type).includes(pid)) return type;
+  }
+  return null;
+}
 function squadOf(tid) {
+  const ntType = ntTypeOfTid(tid);
+  if (ntType) return ntActiveIds(ntType).map(player).filter(Boolean);
   const ids = db.squads[tid];
   return Array.isArray(ids) ? ids.map(player).filter((p) => p && p.teamId === tid) : [];
 }
@@ -7134,7 +7195,7 @@ function migrateDisciplineByComp() {
   }
   db.settings.discByCompV1 = true;
 }
-function isAvail(p, date, comp: any = null) {
+function isAvail(p, date, comp: any = null, forTid: any = null) {
   if (!p) return false;
   if ((p.banLeft || 0) > 0) return false;
   const c = normDiscComp(comp);
@@ -7145,6 +7206,8 @@ function isAvail(p, date, comp: any = null) {
   }
   if (p.banUntil && (!date || p.banUntil >= date)) return false;
   if (p.out && (!date || p.out.until >= date)) return false;
+  // вызван в сборную: недоступен клубу (кроме матчей самой сборной, где forTid — её tid)
+  if (date && !ntTypeOfTid(forTid) && ntCalledUpTypeOn(p.id, date)) return false;
   return true;
 }
 var ruPlural = (n, a, b, c) => {
@@ -7271,6 +7334,8 @@ function outText(p, date = null) {
 }
 function unavailText(p, date = null, comp: any = null) {
   const out = [];
+  const ntT = date ? ntCalledUpTypeOn(p?.id, date) : null;
+  if (ntT) out.push(ntT === "u21" ? "вызван в молодёжную сборную России U21" : "вызван в сборную России");
   const b = banText(p, date, comp);
   if (b) out.push(`\u0434\u0438\u0441\u043A\u0432\u0430\u043B\u0438\u0444\u0438\u043A\u0430\u0446\u0438\u044F: ${b}`);
   const o = outText(p, date);
@@ -9582,7 +9647,7 @@ function sanitizeLineupForFixture(L: any, tid: string, f: any) {
   const isPidMatchAvail = (id: string) => {
     if (!id || !validPool.has(id)) return false;
     const p = player(id);
-    return isAvail(p, f.date, f.comp) && !loanBusyWith(id, f.date, tid);
+    return isAvail(p, f.date, f.comp, tid) && !loanBusyWith(id, f.date, tid);
   };
   const rawStarters = Array.isArray(L.starters) ? L.starters : [];
   const rawBench = Array.isArray(L.bench) ? L.bench : [];
@@ -9642,7 +9707,7 @@ function fixLineup(L, tid, f, allowLoan = false) {
   const ownSq = squadOf(tid), ownIds = new Set(ownSq.map((p) => p.id));
   const loaned = allowLoan ? loanPoolFor(tid, f).filter((x) => picked.has(x.p.id) && !ownIds.has(x.p.id) && !x.busyWith).map((x) => x.p) : [];
   const sq = [...ownSq, ...loaned];
-  const ok = new Set(sq.filter((p) => isAvail(p, f.date, f.comp) && !loanBusyWith(p.id, f.date, tid)).map((p) => p.id));
+  const ok = new Set(sq.filter((p) => isAvail(p, f.date, f.comp, tid) && !loanBusyWith(p.id, f.date, tid)).map((p) => p.id));
   const F = parseFormation(L.formation);
   const used = /* @__PURE__ */ new Set();
   const starters = [];
@@ -10121,7 +10186,7 @@ async function buildCtx(f) {
   ctx.race = top.length ? top.map((x) => `${x.n} (${tn(x.t)}) \u2014 ${x.g}`).join("; ") : "\u043F\u043E\u043A\u0430 \u043D\u0435\u0442 \u0434\u0430\u043D\u043D\u044B\u0445";
   ctx.weather = await weather(H, f.date, f.time);
   ctx.fat = { home: fatText(f.home, f), away: fatText(f.away, f) };
-  const miss = (s) => squadOf(f[s]).filter((p) => !isAvail(p, f.date, f.comp)).map((p) => `${p.name} (${unavailText(p, f.date, f.comp) || "\u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D"})`);
+  const miss = (s) => squadOf(f[s]).filter((p) => !isAvail(p, f.date, f.comp, f[s])).map((p) => `${p.name} (${unavailText(p, f.date, f.comp) || "\u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D"})`);
   ctx.missing = { home: miss("home"), away: miss("away") };
   const cH = getCoachForTeam(f.home), cA = getCoachForTeam(f.away);
   const sH = getStaffForTeam(f.home), sA = getStaffForTeam(f.away);
@@ -21377,6 +21442,11 @@ function friendlyConflict(tid, date) {
   const clash = (db.fixtures || []).find((f) => (f.home === tid || f.away === tid) && (f.gameDate || f.date) === date);
   return clash ? `\u0423 \u043A\u043B\u0443\u0431\u0430 \xAB${tn(tid)}\xBB \u0443\u0436\u0435 \u043D\u0430\u0437\u043D\u0430\u0447\u0435\u043D \u043C\u0430\u0442\u0447 \u043D\u0430 ${date}` : null;
 }
+function refundNtFriendlyIfNeeded(r) {
+  if (!r || !r.nationalType || r.adsRefunded || r.status === "approved") return;
+  r.adsRefunded = true;
+  refundNtFriendlyAds(db, r.clubId);
+}
 function expireFriendlies() {
   const today = todayMsk();
   let ch = false;
@@ -21384,6 +21454,7 @@ function expireFriendlies() {
     const checkDate = r.realDate || r.date;
     if (r.status === "pending" && checkDate < today) {
       r.status = "expired";
+      refundNtFriendlyIfNeeded(r);
       r.rejectReason = "\u041D\u0430\u0441\u0442\u043E\u044F\u0449\u0430\u044F \u0434\u0430\u0442\u0430 \u043C\u0430\u0442\u0447\u0430 \u043F\u0440\u043E\u0448\u043B\u0430, \u0430 \u0437\u0430\u044F\u0432\u043A\u0430 \u043D\u0435 \u0431\u044B\u043B\u0430 \u043F\u043E\u043B\u043D\u043E\u0441\u0442\u044C\u044E \u0441\u043E\u0433\u043B\u0430\u0441\u043E\u0432\u0430\u043D\u0430";
       r.resolvedAt = (/* @__PURE__ */ new Date()).toISOString();
       ch = true;
@@ -21436,6 +21507,7 @@ var pubFriendly = (r) => {
     conditions: r.conditions,
     budget: r.budget,
     formattedBudget: fmtEuro(r.budget),
+    nationalType: r.nationalType || "",
     needOpponentApproval: !!r.needOpponentApproval,
     opponentApproval: r.opponentApproval,
     adminApproval: r.adminApproval,
@@ -21453,6 +21525,7 @@ function tryFinalizeFriendly(r) {
   if (!(clubOk && r.adminApproval === "approved")) return { executed: false };
   const reject = (why) => {
     r.status = "rejected";
+    refundNtFriendlyIfNeeded(r);
     r.rejectReason = why;
     r.resolvedAt = (/* @__PURE__ */ new Date()).toISOString();
     return { executed: false, error: why };
@@ -21465,8 +21538,11 @@ function tryFinalizeFriendly(r) {
   const realTime = r.realTime || r.time || "19:00";
   if (realDate < todayMsk()) return reject("\u041D\u0430\u0441\u0442\u043E\u044F\u0449\u0430\u044F \u0434\u0430\u0442\u0430 \u043C\u0430\u0442\u0447\u0430 \u0443\u0436\u0435 \u043F\u0440\u043E\u0448\u043B\u0430");
   if (!friendlyBreakFor(gameDate)) return reject("\u0418\u0433\u0440\u043E\u0432\u0430\u044F \u0434\u0430\u0442\u0430 \u043D\u0435 \u043F\u043E\u043F\u0430\u0434\u0430\u0435\u0442 \u0432 \u043E\u0444\u0438\u0446\u0438\u0430\u043B\u044C\u043D\u0443\u044E \u043F\u0430\u0443\u0437\u0443 \u043D\u0430 \u0441\u0431\u043E\u0440\u043D\u044B\u0435");
-  const clash = friendlyConflict(A.id, gameDate) || friendlyConflict(B.id, gameDate);
+  const ntOfficial = r.nationalType && (ntCurrent(r.nationalType)?.matches || []).some((m) => (m.gameDate || m.date) === gameDate);
+  const clash = friendlyConflict(A.id, gameDate) || friendlyConflict(B.id, gameDate) || (ntOfficial ? "В этот день у сборной официальный матч" : null);
+  if (r.nationalType && ntActiveIds(r.nationalType).length < 14) return reject("Сборная ещё не сформирована: администратор не вызвал достаточно игроков");
   if (clash) return reject(clash);
+  const skipMoney = !!r.nationalType;
   ensureInitialBudgets();
   const budget = Math.round(Number(r.budget) || 0);
   const prevA = A.budget || 0;
@@ -21474,7 +21550,7 @@ function tryFinalizeFriendly(r) {
   if (!Array.isArray(db.budgetHistory)) db.budgetHistory = [];
   const nowIso = (/* @__PURE__ */ new Date()).toISOString();
   A.budget = prevA - budget;
-  db.budgetHistory.push({
+  if (!skipMoney) db.budgetHistory.push({
     id: uid(),
     teamId: A.id,
     teamName: A.name,
@@ -21490,7 +21566,7 @@ function tryFinalizeFriendly(r) {
   if (FRIENDLY_PAY_OPPONENT) {
     const prevB = B.budget || 0;
     B.budget = prevB + budget;
-    db.budgetHistory.push({
+    if (!skipMoney) db.budgetHistory.push({
       id: uid(),
       teamId: B.id,
       teamName: B.name,
@@ -21505,7 +21581,7 @@ function tryFinalizeFriendly(r) {
     });
   }
   for (const t of [A, B]) {
-    if (squadOf(t.id).length === 0) {
+    if (!ntTypeOfTid(t.id) && squadOf(t.id).length === 0) {
       try {
         const ids = [];
         for (const p of generateFullSquad(t)) {
@@ -21541,6 +21617,7 @@ function tryFinalizeFriendly(r) {
     friendlyId: r.id,
     friendlyBudget: budget,
     friendlyConditions: r.conditions,
+    nationalType: r.nationalType || void 0,
     neutralField: place.neutral,
     stadium: place.neutral ? `${place.stadium} (\u043D\u0435\u0439\u0442\u0440\u0430\u043B\u044C\u043D\u043E\u0435 \u043F\u043E\u043B\u0435${place.city ? ", \u0433. " + place.city : ""})` : place.stadium,
     city: place.city || void 0
@@ -21569,6 +21646,15 @@ function tryFinalizeFriendly(r) {
   }
   return { executed: true };
 }
+function ntFriendlyInfo(tid) {
+  ensureNtTeams();
+  const teams = (["main", "u21"] as const).map((type) => {
+    const t = team(NT_TID[type]);
+    const brks = upcomingFriendlyBreaks().filter((b) => ntBreakHasMatches(type, b));
+    return { type, id: NT_TID[type], name: t?.name || (type === "u21" ? "Сборная России U21" : "Сборная России"), logo: teamLogo(NT_TID[type]), squadSize: ntActiveIds(type).length, breaks: brks };
+  });
+  return { ads: getNtFriendlyAdSummary(db, tid), teams, requiredAds: NT_FRIENDLY_REQUIRED_ADS };
+}
 function friendlyForClub(tid) {
   expireFriendlies();
   const all = db.friendlyRequests || [];
@@ -21584,6 +21670,7 @@ function friendlyForClub(tid) {
     breaks: upcomingFriendlyBreaks(),
     breakUsage: getFriendlyBreakUsage(db, tid),
     breakLimit: 9,
+    national: ntFriendlyInfo(tid),
     adCooldownMs: frCd.cooldownMs,
     adCooldownRemainingMs: frCd.cooldownRemainingMs,
     adNextAvailableAt: frCd.nextAvailableAt
@@ -21596,6 +21683,7 @@ app.post("/api/club/friendly/request", needClub, (req, res) => {
   if (!A) return fail(res, "\u041A\u043B\u0443\u0431 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
   const B = team(String(b.opponentId || ""));
   if (!B) return fail(res, "\u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u043A\u043E\u043C\u0430\u043D\u0434\u0443-\u0441\u043E\u043F\u0435\u0440\u043D\u0438\u043A\u0430");
+  if (B.national || ntTypeOfTid(B.id)) return fail(res, "Матч со сборной России подаётся отдельной формой «Сборная России» (нужно набрать 100 просмотров рекламы).");
   if (B.id === A.id) return fail(res, "\u041D\u0435\u043B\u044C\u0437\u044F \u043F\u0440\u0438\u0433\u043B\u0430\u0441\u0438\u0442\u044C \u043D\u0430 \u043C\u0430\u0442\u0447 \u0441\u0430\u043C\u043E\u0433\u043E \u0441\u0435\u0431\u044F");
   const venue = ["home", "away", "neutral"].includes(b.venue) ? b.venue : "";
   if (!venue) return fail(res, "\u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u043C\u0435\u0441\u0442\u043E \u043F\u0440\u043E\u0432\u0435\u0434\u0435\u043D\u0438\u044F \u043C\u0430\u0442\u0447\u0430");
@@ -21674,6 +21762,78 @@ ${needClub2 ? "\u041D\u0443\u0436\u043D\u044B \u0441\u043E\u0433\u043B\u0430\u04
     message: needClub2 ? `\u0417\u0430\u044F\u0432\u043A\u0430 \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0430 \u043A\u043B\u0443\u0431\u0443 \xAB${B.name}\xBB \u0438 \u0430\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440\u0443. \u041C\u0430\u0442\u0447 \u0441\u043E\u0441\u0442\u043E\u0438\u0442\u0441\u044F, \u043A\u043E\u0433\u0434\u0430 \u0435\u0451 \u043F\u0440\u0438\u043C\u0443\u0442 \u043E\u0431\u0430.` : `\u0417\u0430\u044F\u0432\u043A\u0430 \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0430 \u0430\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440\u0443 \u2014 \xAB${B.name}\xBB \u0438\u0433\u0440\u0430\u0435\u0442 \u043D\u0435 \u0432 \u0420\u041F\u041B, \u043F\u043E\u044D\u0442\u043E\u043C\u0443 \u0440\u0435\u0448\u0435\u043D\u0438\u0435 \u0437\u0430 \u0430\u0434\u043C\u0438\u043D\u043E\u043C.`
   });
 });
+app.post("/api/club/friendly/national/request", needClub, (req, res) => {
+  expireFriendlies();
+  ensureNtTeams();
+  const b = req.body || {};
+  const A = team(req.tid);
+  if (!A) return fail(res, "Клуб не найден");
+  const type = b.opponentType === "u21" ? "u21" : "main";
+  const B = team(NT_TID[type]);
+  if (!B) return fail(res, "Сборная не найдена");
+  const venue = ["home", "away", "neutral"].includes(b.venue) ? b.venue : "";
+  if (!venue) return fail(res, "Выберите место проведения матча");
+  const neutralStadium = cleanTxt(b.neutralStadium, 80);
+  const neutralCity = cleanTxt(b.neutralCity, 60);
+  if (venue === "neutral" && !neutralStadium && !neutralCity) return fail(res, "Для нейтрального поля укажите стадион или город");
+  const gameDate = String(b.gameDate || b.date || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(gameDate)) return fail(res, "Укажите игровую дату матча");
+  const matchedBreak = friendlyBreakFor(gameDate);
+  if (!matchedBreak) return fail(res, "Игровая дата должна попадать в официальную паузу на сборные");
+  if (!ntBreakHasMatches(type, matchedBreak)) {
+    return fail(res, `В паузу «${matchedBreak.name}» ${type === "u21" ? "молодёжная сборная" : "сборная России"} не собирается (нет назначенных матчей сборной) — выберите другую паузу.`);
+  }
+  if (ntActiveIds(type).length < 14) return fail(res, "Сборная ещё не сформирована — администратор не вызвал достаточно игроков.");
+  if ((ntCurrent(type)?.matches || []).some((m) => (m.gameDate || m.date) === gameDate)) return fail(res, "В этот день у сборной официальный матч — выберите другую дату.");
+  const clash = friendlyConflict(A.id, gameDate) || friendlyConflict(B.id, gameDate);
+  if (clash) return fail(res, clash);
+  let gameTime = String(b.gameTime || b.time || "15:00").trim();
+  if (!/^\d{1,2}:\d{2}$/.test(gameTime)) return fail(res, "Некорректное игровое время матча");
+  if (gameTime.length === 4) gameTime = "0" + gameTime;
+  const realDate = String(b.realDate || todayMsk()).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(realDate)) return fail(res, "Укажите настоящее (реальное) число матча");
+  if (realDate < todayMsk()) return fail(res, "Реальная дата проведения матча не может быть в прошлом");
+  let realTime = String(b.realTime || "19:00").trim();
+  if (!/^\d{1,2}:\d{2}$/.test(realTime)) return fail(res, "Некорректное настоящее (реальное) время матча");
+  if (realTime.length === 4) realTime = "0" + realTime;
+  const conditions = cleanTxt(b.conditions, 500) || "Товарищеский матч со сборной России";
+  if ((db.friendlyRequests ||= []).some((r2) => r2.status === "pending" && r2.clubId === A.id && r2.opponentId === B.id && (r2.gameDate || r2.date) === gameDate)) {
+    return fail(res, "Такая заявка на эту игровую дату уже подана и ждёт решения");
+  }
+  const spent = spendNtFriendlyAds(db, A.id);
+  if (!spent.ok) return fail(res, spent.error);
+  const r = {
+    id: "fr_" + uid(),
+    clubId: A.id,
+    opponentId: B.id,
+    nationalType: type,
+    adsSpent: NT_FRIENDLY_REQUIRED_ADS,
+    venue,
+    neutralStadium,
+    neutralCity,
+    date: gameDate,
+    time: gameTime,
+    gameDate,
+    gameTime,
+    realDate,
+    realTime,
+    conditions,
+    budget: 0,
+    needOpponentApproval: false,
+    opponentApproval: "not_required",
+    adminApproval: "pending",
+    status: "pending",
+    fixtureId: null,
+    createdAt: new Date().toISOString()
+  };
+  db.friendlyRequests.unshift(r);
+  save();
+  try {
+    tg(`🇷🇺 <b>Заявка на матч со сборной</b>\n«${esc(A.name)}» — «${esc(B.name)}»\n🎮 Игровое: <b>${esc(gameDate)} ${esc(gameTime)}</b>\n⏰ Настоящее: <b>${esc(realDate)} ${esc(realTime)} МСК</b>\n📺 Оплачено просмотрами рекламы: ${NT_FRIENDLY_REQUIRED_ADS}\n<i>${esc(conditions)}</i>`);
+  } catch {
+  }
+  res.json({ ok: 1, request: pubFriendly(r), message: "Заявка отправлена администратору. Если её отклонят — 100 просмотров вернутся на счёт клуба.", ads: getNtFriendlyAdSummary(db, A.id) });
+});
 app.post("/api/club/friendly/respond", needClub, (req, res) => {
   expireFriendlies();
   const { requestId, action } = req.body || {};
@@ -21683,6 +21843,7 @@ app.post("/api/club/friendly/respond", needClub, (req, res) => {
   if (action === "cancel") {
     if (r.clubId !== req.tid) return fail(res, "\u041E\u0442\u043E\u0437\u0432\u0430\u0442\u044C \u0437\u0430\u044F\u0432\u043A\u0443 \u043C\u043E\u0436\u0435\u0442 \u0442\u043E\u043B\u044C\u043A\u043E \u043F\u0440\u0438\u0433\u043B\u0430\u0441\u0438\u0432\u0448\u0438\u0439 \u043A\u043B\u0443\u0431");
     r.status = "cancelled";
+    refundNtFriendlyIfNeeded(r);
     r.rejectReason = `\u0417\u0430\u044F\u0432\u043A\u0430 \u043E\u0442\u043E\u0437\u0432\u0430\u043D\u0430 \u043A\u043B\u0443\u0431\u043E\u043C \xAB${tn(r.clubId)}\xBB`;
     r.resolvedAt = (/* @__PURE__ */ new Date()).toISOString();
     save();
@@ -21746,6 +21907,7 @@ app.post("/api/admin/friendly/resolve", admin, (req, res) => {
   if (action === "reject") {
     r.adminApproval = "rejected";
     r.status = "rejected";
+    refundNtFriendlyIfNeeded(r);
     r.rejectReason = cleanTxt(comment, 200) || "\u041E\u0442\u043A\u043B\u043E\u043D\u0435\u043D\u043E \u0430\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440\u043E\u043C";
     r.resolvedAt = (/* @__PURE__ */ new Date()).toISOString();
     save();

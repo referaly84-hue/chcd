@@ -7176,7 +7176,7 @@ async function pgClub(app) {
     const fr = c.friendly || { incoming: [], outgoing: [], history: [], breaks: [] };
     const stT = { pending: ['⏳ Ждёт решения', '#fef9c3;color:#854d0e'], approved: ['✅ Матч назначен', '#dcfce7;color:#166534'], rejected: ['❌ Отклонена', '#fee2e2;color:#991b1b'], cancelled: ['↩ Отозвана', '#e2e8f0;color:#334155'], expired: ['⌛ Истекла', '#e2e8f0;color:#334155'] };
     const appr = (v) => v === 'approved' ? '✅' : v === 'rejected' ? '❌' : v === 'not_required' ? '—' : '⏳';
-    const allTeams = (S.st?.teams || []).filter(t => t.id !== CLUB_TID);
+    const allTeams = (S.st?.teams || []).filter(t => t.id !== CLUB_TID && !t.national && !String(t.id).startsWith('tm_nt_'));
     const compName = (id) => (S.st?.comps || []).find(x => x.id === id)?.name;
     const groups = {};
     allTeams.forEach(t => { const g = compName(t.comp) && t.comp !== 'friendly_match' ? compName(t.comp) : 'Зарубежные и прочие клубы'; (groups[g] ||= []).push(t); });
@@ -7189,7 +7189,7 @@ async function pgClub(app) {
         <div class="muted small" style="margin:4px 0">
           🎮 <b>Игровое:</b> ${e(r.gameDate || r.date)} ${e(r.gameTime || r.time)} · 
           ⏰ <b>Настоящее:</b> ${e(r.realDate || r.date)} ${e(r.realTime || r.time || '19:00')} МСК · 
-          ${e(r.venueText)}${r.venue === 'neutral' ? ` (${e(r.stadium)}${r.city ? ', ' + e(r.city) : ''})` : ''} · 💶 <b>${e(r.formattedBudget)}</b>
+          ${e(r.venueText)}${r.venue === 'neutral' ? ` (${e(r.stadium)}${r.city ? ', ' + e(r.city) : ''})` : ''} · ${r.nationalType ? '📺 <b>100 просмотров рекламы</b>' : '💶 <b>' + e(r.formattedBudget) + '</b>'}
         </div>
         <div class="small">Условия: ${e(r.conditions)}</div>
         <div class="muted small" style="margin-top:4px">Админ: ${appr(r.adminApproval)}${r.needOpponentApproval ? ` · «${e(r.opponentName)}»: ${appr(r.opponentApproval)}` : ` · ${e(r.opponentCompName)}: решает только админ`}</div>
@@ -7197,6 +7197,52 @@ async function pgClub(app) {
         ${mine && r.status === 'pending' ? `<button class="btn sm" style="margin-top:6px" data-fr-cancel="${r.id}">Отозвать заявку</button>` : ''}
       </div>`;
     const nowFr = Date.now();
+    const ntInfo = fr.national || { teams: [], ads: null };
+    const ntAds = ntInfo.ads || { required: 100, points: 0, ready: false, dailyLimit: 30, dailyUsed: 0, limitReached: false, cooldownMs: 180000, cooldownRemainingMs: 0, nextAvailableAt: null, blockKeys: ['nt_friendly_a', 'nt_friendly_b'] };
+    const ntTeams = ntInfo.teams || [];
+    const ntCdTarget = Number(ntAds.nextAvailableAt || 0) || (Number(ntAds.cooldownRemainingMs || 0) > 0 ? nowFr + Number(ntAds.cooldownRemainingMs) : 0);
+    const ntInCd = ntCdTarget > nowFr;
+    const ntPct = Math.min(100, Math.round((ntAds.points / ntAds.required) * 100));
+    const ntWatchOff = ntAds.ready || ntAds.limitReached || ntInCd;
+    const ntFmtCd = (ms) => { const sec = Math.max(1, Math.ceil(ms / 1000)); return String(Math.floor(sec / 60)).padStart(2, '0') + ':' + String(sec % 60).padStart(2, '0'); };
+    const ntPanel = `
+      <div class="panel" id="nt_panel" style="margin-top:12px;border:1.5px solid #bfdbfe">
+        <h3 style="margin:0 0 4px">🇷🇺 Товарищеский матч со сборной России / U21</h3>
+        <p class="muted small" style="margin:0 0 8px">Заявка стоит <b>${ntAds.required} просмотров рекламы</b> (два рекламных блока суммируются). Не больше <b>${ntAds.dailyLimit}</b> просмотров в сутки, перерыв между просмотрами — <b>3 минуты</b>. Решает администратор; если заявку отклонят или она истечёт, ${ntAds.required} просмотров вернутся. Пока игрок вызван в сборную, он не играет за клуб ни в одном матче паузы (в том числе в товарищеских).</p>
+        <div style="background:var(--soft);border:1px solid var(--border);border-radius:8px;padding:10px">
+          <div class="row sp" style="gap:8px;flex-wrap:wrap"><b>Набрано: ${ntAds.points} / ${ntAds.required}</b><span class="muted small">Сегодня: ${ntAds.dailyUsed} / ${ntAds.dailyLimit}</span></div>
+          <div style="height:10px;background:#e2e8f0;border-radius:6px;margin:6px 0;overflow:hidden"><div style="height:100%;width:${ntPct}%;background:#2563eb"></div></div>
+          <div class="row" style="gap:8px;flex-wrap:wrap">
+            <button type="button" class="btn sm" data-nt-watch="nt_friendly_a" ${ntWatchOff ? 'disabled' : ''}>▶ Смотреть рекламу (1)</button>
+            <button type="button" class="btn sm alt" data-nt-watch="nt_friendly_b" ${ntWatchOff ? 'disabled' : ''}>▶ Смотреть рекламу (2)</button>
+            ${ntInCd ? `<span class="small" style="align-self:center;font-variant-numeric:tabular-nums">Перерыв: <b data-nt-cd="${ntCdTarget}">${ntFmtCd(ntCdTarget - nowFr)}</b></span>` : ''}
+          </div>
+          ${ntAds.limitReached ? '<div class="small" style="margin-top:6px;color:#991b1b">Дневной лимит исчерпан — продолжите позже.</div>' : ''}
+          ${ntAds.ready ? '<div class="small" style="margin-top:6px;color:#166534">Просмотры набраны — можно подавать заявку ниже.</div>' : ''}
+        </div>
+        ${ntTeams.length ? `
+        <div class="row" style="gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">
+          <label class="small" style="flex:2;min-width:200px">Сборная<br><select id="nt_team" style="width:100%">${ntTeams.map(t => `<option value="${e(t.type)}">${e(t.name)} · вызвано игроков: ${t.squadSize}</option>`).join('')}</select></label>
+          <label class="small" style="flex:1;min-width:150px">Место проведения<br><select id="nt_venue" style="width:100%"><option value="home">У нас дома</option><option value="away">В гостях</option><option value="neutral">Нейтральное поле</option></select></label>
+        </div>
+        <div id="nt_neutral" class="row" style="gap:10px;margin-top:8px;display:none">
+          <label class="small" style="flex:1">Стадион<br><input id="nt_nst" maxlength="80" placeholder="Название стадиона"></label>
+          <label class="small" style="flex:1">Город<br><input id="nt_nct" maxlength="60" placeholder="Город"></label>
+        </div>
+        <div class="row" style="gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">
+          <label class="small" style="flex:2;min-width:200px">Пауза, где сборная собирается<br><select id="nt_break" style="width:100%"></select></label>
+          <label class="small" style="flex:1;min-width:140px">Игровая дата<br><input type="date" id="nt_date" style="width:100%"></label>
+          <label class="small" style="width:110px">Игровое время<br><input type="time" id="nt_time" value="15:00" style="width:100%"></label>
+        </div>
+        <div class="row" style="gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">
+          <label class="small" style="flex:1;min-width:160px">Реальная дата (МСК)<br><input type="date" id="nt_real_date" style="width:100%"></label>
+          <label class="small" style="width:120px">Реальное время (МСК)<br><input type="time" id="nt_real_time" value="19:00" style="width:100%"></label>
+        </div>
+        <label class="small" style="display:block;margin-top:10px">Условия матча (необязательно)<br><textarea id="nt_cond" rows="2" maxlength="500" style="width:100%;max-width:560px" placeholder="Например: 2 тайма по 45 минут, до 6 замен"></textarea></label>
+        <div id="nt_hint" class="muted small" style="margin-top:6px"></div>
+        <button type="button" class="btn" id="nt_send" style="margin-top:8px" ${ntAds.ready ? '' : 'disabled'}>Подать заявку (спишется ${ntAds.required} просмотров)</button>
+        ` : '<div class="muted small" style="margin-top:8px">Сборные пока недоступны.</div>'}
+      </div>`;
     const frCdTarget = Number(fr.adNextAvailableAt || 0) ||
       (Number(fr.adCooldownRemainingMs || 0) > 0 ? nowFr + Number(fr.adCooldownRemainingMs) : 0);
     const frInCd = frCdTarget > nowFr;
@@ -7226,6 +7272,7 @@ async function pgClub(app) {
             </div>
           </div>`).join('') : '<div class="muted small" style="margin-top:8px">Входящих приглашений нет.</div>'}
       </div>
+      ${ntPanel}
       <div class="panel" style="margin-top:12px">
         <h3 style="margin:0 0 6px">Предложить товарищеский матч</h3>
         ${fr.breaks.length ? `
@@ -7305,6 +7352,77 @@ async function pgClub(app) {
           setTimeout(() => pgClub(app), 400);
         }
       }, 1000);
+    }
+    if (window.__ntCdTimer) { clearInterval(window.__ntCdTimer); window.__ntCdTimer = null; }
+    const ntBox = cb.querySelector('#nt_panel');
+    if (ntBox) {
+      const q = (sel) => ntBox.querySelector(sel);
+      if (ntInCd) {
+        window.__ntCdTimer = setInterval(() => {
+          const el = ntBox.querySelector('[data-nt-cd]');
+          if (!document.body.contains(ntBox) || !el) { clearInterval(window.__ntCdTimer); window.__ntCdTimer = null; return; }
+          const rem = Number(el.dataset.ntCd) - Date.now();
+          if (rem > 0) el.textContent = ntFmtCd(rem);
+          else { clearInterval(window.__ntCdTimer); window.__ntCdTimer = null; setTimeout(() => pgClub(app), 300); }
+        }, 1000);
+      }
+      ntBox.querySelectorAll('[data-nt-watch]').forEach(b => b.onclick = async () => {
+        if (b.disabled) return;
+        const blockKey = b.dataset.ntWatch;
+        const ext = await ensureExt();
+        const adRes = await ext.runAdsgramBlock(
+          blockKey,
+          'Матч со сборной России',
+          'Досмотрите рекламу до конца — просмотр засчитается в счётчик заявки.',
+          { teamId: CLUB_TID }
+        );
+        if (!adRes) return;
+        const r = await act(() => api('/club/friendly/national/ad-credit', withT({ blockKey, adProof: adRes.adProof })), 'Просмотр засчитан');
+        pgClub(app);
+      });
+      if (q('#nt_team')) {
+        const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Moscow' });
+        q('#nt_real_date').value = today;
+        q('#nt_real_date').min = today;
+        const curTeam = () => ntTeams.find(t => t.type === q('#nt_team').value);
+        const syncDate = () => {
+          const v = q('#nt_break').value;
+          if (!v) return;
+          const [a, z] = v.split('|');
+          q('#nt_date').min = a;
+          q('#nt_date').max = z;
+          if (!q('#nt_date').value || q('#nt_date').value < a || q('#nt_date').value > z) q('#nt_date').value = a;
+        };
+        const fillBreaks = () => {
+          const t = curTeam();
+          const bs = t?.breaks || [];
+          q('#nt_break').innerHTML = bs.length
+            ? bs.map(b => `<option value="${e(b.start)}|${e(b.end)}">${e(b.name)} (${e(b.start)} — ${e(b.end)})</option>`).join('')
+            : '<option value="">нет пауз, где эта сборная собирается</option>';
+          q('#nt_hint').textContent = !bs.length ? 'У этой сборной пока нет назначенных матчей в паузах — заявку подать нельзя.'
+            : (t.squadSize < 14 ? 'Сборная ещё не сформирована — администратор не вызвал достаточно игроков.' : '');
+          syncDate();
+        };
+        q('#nt_team').onchange = fillBreaks;
+        q('#nt_break').onchange = syncDate;
+        q('#nt_venue').onchange = () => { q('#nt_neutral').style.display = q('#nt_venue').value === 'neutral' ? 'flex' : 'none'; };
+        fillBreaks();
+        q('#nt_send').onclick = async () => {
+          if (q('#nt_send').disabled) return;
+          const r = await act(() => api('/club/friendly/national/request', withT({
+            opponentType: q('#nt_team').value,
+            venue: q('#nt_venue').value,
+            neutralStadium: q('#nt_nst').value,
+            neutralCity: q('#nt_nct').value,
+            gameDate: q('#nt_date').value,
+            gameTime: q('#nt_time').value,
+            realDate: q('#nt_real_date').value,
+            realTime: q('#nt_real_time').value,
+            conditions: q('#nt_cond').value
+          })), 'Заявка на матч со сборной отправлена');
+          if (r) pgClub(app);
+        };
+      }
     }
     cb.querySelectorAll('[data-fr-ok]').forEach(b => b.onclick = async () => {
       if (b.disabled) return;

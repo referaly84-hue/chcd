@@ -74,6 +74,26 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
     maxPerCycle: 30,
   },
   {
+    key: 'nt_friendly_a',
+    label: 'Матч со сборной России / U21 — Реклама 1 (в сумме 100 просмотров на матч)',
+    category: 'friendly',
+    format: 'long',
+    durationSec: 15,
+    requiresClick: false,
+    defaultBlockId: '61002',
+    maxPerCycle: 30,
+  },
+  {
+    key: 'nt_friendly_b',
+    label: 'Матч со сборной России / U21 — Реклама 2 (в сумме 100 просмотров на матч)',
+    category: 'friendly',
+    format: 'short',
+    durationSec: 5,
+    requiresClick: false,
+    defaultBlockId: 'int-61004',
+    maxPerCycle: 30,
+  },
+  {
     key: 'coins_short',
     label: 'Прогнозы — Быстрый пас (5с, +1 монета)',
     category: 'predictions',
@@ -259,6 +279,124 @@ function getCooldownLeftMs(lastAt: any): number {
   const ts = Number(lastAt || 0);
   if (!ts) return 0;
   return Math.max(0, ts + AD_COOLDOWN_MS - Date.now());
+}
+
+/* ───────── Товарищеский матч со сборной России / U21: 100 реклам ─────────
+   Два блока (nt_friendly_a и nt_friendly_b) суммируются в один счётчик клуба.
+   Лимит — 30 просмотров за 24 часа (на клуб, оба блока вместе), пауза между просмотрами — 3 минуты.
+   Набранные просмотры хранятся в db.ntFriendlyAds[teamId].points и списываются при подаче заявки. */
+export const NT_FRIENDLY_BLOCK_KEYS = ['nt_friendly_a', 'nt_friendly_b'] as const;
+export const NT_FRIENDLY_REQUIRED_ADS = 100;
+export const NT_FRIENDLY_DAILY_LIMIT = 30;
+export const NT_FRIENDLY_COOLDOWN_MS = 3 * 60 * 1000;
+
+function ensureNtFriendlyState(db: any, teamId: string) {
+  db.ntFriendlyAds ||= {};
+  let st = db.ntFriendlyAds[teamId];
+  if (!st || typeof st !== 'object') {
+    st = { points: 0, total: 0, spent: 0, byBlock: {}, cycleStartedAt: 0, dayViews: 0, lastAdAt: 0 };
+    db.ntFriendlyAds[teamId] = st;
+  }
+  const now = Date.now();
+  if (st.cycleStartedAt > 0 && now - st.cycleStartedAt >= CYCLE_MS) {
+    st.cycleStartedAt = 0;
+    st.dayViews = 0;
+  }
+  st.points = Math.max(0, Number(st.points || 0));
+  st.total = Math.max(0, Number(st.total || 0));
+  st.spent = Math.max(0, Number(st.spent || 0));
+  st.dayViews = Math.max(0, Number(st.dayViews || 0));
+  st.lastAdAt = Number(st.lastAdAt || 0);
+  st.byBlock ||= {};
+  return st;
+}
+
+export function getNtFriendlyAdSummary(db: any, teamId: string) {
+  const st = ensureNtFriendlyState(db, teamId);
+  const now = Date.now();
+  const cdLeft = st.lastAdAt ? Math.max(0, st.lastAdAt + NT_FRIENDLY_COOLDOWN_MS - now) : 0;
+  const limitReached = st.dayViews >= NT_FRIENDLY_DAILY_LIMIT;
+  return {
+    required: NT_FRIENDLY_REQUIRED_ADS,
+    points: Math.min(NT_FRIENDLY_REQUIRED_ADS, st.points),
+    ready: st.points >= NT_FRIENDLY_REQUIRED_ADS,
+    dailyLimit: NT_FRIENDLY_DAILY_LIMIT,
+    dailyUsed: Math.min(NT_FRIENDLY_DAILY_LIMIT, st.dayViews),
+    limitReached,
+    limitResetsAt: limitReached && st.cycleStartedAt ? st.cycleStartedAt + CYCLE_MS : null,
+    cooldownMs: NT_FRIENDLY_COOLDOWN_MS,
+    cooldownRemainingMs: cdLeft,
+    nextAvailableAt: cdLeft > 0 ? now + cdLeft : null,
+    byBlock: { ...st.byBlock },
+    blockKeys: [...NT_FRIENDLY_BLOCK_KEYS],
+  };
+}
+
+export function checkNtFriendlyAdAllowed(db: any, teamId: string): { ok: true } | { ok: false; error: string } {
+  const st = ensureNtFriendlyState(db, teamId);
+  if (st.points >= NT_FRIENDLY_REQUIRED_ADS) {
+    return { ok: false, error: `Уже набрано ${NT_FRIENDLY_REQUIRED_ADS} просмотров — подайте заявку на матч со сборной.` };
+  }
+  if (st.dayViews >= NT_FRIENDLY_DAILY_LIMIT) {
+    return { ok: false, error: `Дневной лимит исчерпан (${NT_FRIENDLY_DAILY_LIMIT}/${NT_FRIENDLY_DAILY_LIMIT}). Продолжите после обновления лимита.` };
+  }
+  const cdLeft = st.lastAdAt ? Math.max(0, st.lastAdAt + NT_FRIENDLY_COOLDOWN_MS - Date.now()) : 0;
+  if (cdLeft > 0) {
+    return { ok: false, error: `Перерыв между просмотрами: подождите ещё ${fmtCooldownWords(cdLeft)}.` };
+  }
+  return { ok: true };
+}
+
+/** Засчитывает один просмотр (adProof от /api/ads/complete) в счётчик клуба. */
+export function creditNtFriendlyAd(
+  ctx: AdServerContext,
+  teamId: string,
+  blockKey: string,
+  actorKey: string,
+  adProof?: string
+): { ok: true } | { ok: false; error: string } {
+  const db = ctx.getDb();
+  if (!(NT_FRIENDLY_BLOCK_KEYS as readonly string[]).includes(blockKey)) {
+    return { ok: false, error: 'Неизвестный рекламный блок для матча со сборной.' };
+  }
+  const chk = checkNtFriendlyAdAllowed(db, teamId);
+  if (!chk.ok) return chk;
+  const v = verifyAndConsumeAdProof(adProof, blockKey, actorKey, false, actorKey.startsWith('club:') ? 'admin' : undefined);
+  if (!v.ok) return v;
+  const st = ensureNtFriendlyState(db, teamId);
+  const now = Date.now();
+  if (!st.cycleStartedAt) st.cycleStartedAt = now;
+  st.dayViews += 1;
+  st.points += 1;
+  st.total += 1;
+  st.lastAdAt = now;
+  st.byBlock[blockKey] = Number(st.byBlock[blockKey] || 0) + 1;
+  pushAdEvent(ctx, {
+    type: 'credit',
+    blockKey,
+    blockId: getAdsgramBlocks(db)[blockKey] || blockKey,
+    actorKey,
+    detail: `Матч со сборной: просмотр ${Math.min(st.points, NT_FRIENDLY_REQUIRED_ADS)}/${NT_FRIENDLY_REQUIRED_ADS}`,
+  });
+  return { ok: true };
+}
+
+/** Списывает 100 просмотров при подаче заявки. */
+export function spendNtFriendlyAds(db: any, teamId: string): { ok: true } | { ok: false; error: string } {
+  const st = ensureNtFriendlyState(db, teamId);
+  if (st.points < NT_FRIENDLY_REQUIRED_ADS) {
+    return { ok: false, error: `Для заявки нужно ${NT_FRIENDLY_REQUIRED_ADS} просмотров рекламы, набрано ${st.points}.` };
+  }
+  st.points -= NT_FRIENDLY_REQUIRED_ADS;
+  st.spent += NT_FRIENDLY_REQUIRED_ADS;
+  return { ok: true };
+}
+
+/** Возвращает 100 просмотров, если заявка отклонена / отозвана / истекла. */
+export function refundNtFriendlyAds(db: any, teamId: string) {
+  const st = ensureNtFriendlyState(db, teamId);
+  st.points += NT_FRIENDLY_REQUIRED_ADS;
+  st.spent = Math.max(0, st.spent - NT_FRIENDLY_REQUIRED_ADS);
 }
 
 function fmtCooldownWords(ms: number): string {
@@ -3196,6 +3334,10 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
         if (frCd.cooldownRemainingMs > 0) {
           return ctx.fail(res, `Перерыв между рекламами: подождите ещё ${fmtCooldownWords(frCd.cooldownRemainingMs)}.`);
         }
+      } else if ((NT_FRIENDLY_BLOCK_KEYS as readonly string[]).includes(blockKey)) {
+        if (!actor.teamId) return ctx.fail(res, 'Реклама для матча со сборной доступна только из кабинета клуба.');
+        const ntFrCheck = checkNtFriendlyAdAllowed(db, actor.teamId);
+        if (!ntFrCheck.ok) return ctx.fail(res, ntFrCheck.error);
       } else if (blockKey === 'interview_ask') {
         const ivCheck = checkInterviewAdAllowed(db, actor.actorKey);
         if (!ivCheck.ok) return ctx.fail(res, ivCheck.error);
@@ -3437,6 +3579,17 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
   app.post('/api/ads/sdk-reward', handleSdkS2SReward);
 
   // ─── Club Sponsors & RFS Bonus ────────────────────────────────────────────────
+  // ─── Товарищеский матч со сборной: засчитать просмотр рекламы (100 просмотров на заявку) ───
+  app.post('/api/club/friendly/national/ad-credit', ctx.needClub, (req: any, res) => {
+    const db = ctx.getDb();
+    const blockKey = String(req.body?.blockKey || '').trim();
+    const actor = resolveActor(req);
+    const out = creditNtFriendlyAd(ctx, req.tid, blockKey, actor.actorKey, req.body?.adProof);
+    if (!out.ok) return ctx.fail(res, out.error);
+    ctx.save();
+    res.json({ ok: 1, ads: getNtFriendlyAdSummary(db, req.tid) });
+  });
+
   app.get('/api/club/sponsors', ctx.needClub, (req: any, res) => {
     res.json(buildSponsorSummary(ctx, req.tid));
   });

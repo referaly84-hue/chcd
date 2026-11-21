@@ -313,6 +313,7 @@ import {
   spendNtFriendlyAds,
   refundNtFriendlyAds,
   NT_FRIENDLY_REQUIRED_ADS,
+  NT_FRIENDLY_REFUND_ADS,
   getNationalProposals,
   linkTelegramToClub,
   recordInterviewAdCooldown,
@@ -8354,43 +8355,78 @@ function provList() {
 var hasLLM = () => provList().length > 0 && aiAllowed();
 function httpErr(status, body) {
   const raw = JSON.stringify(body);
-  let msg = `HTTP ${status}: ${raw.slice(0, 200)}`;
+  const cleanMsg = extractReadableGeminiMessage(raw);
+  let msg = `HTTP ${status}: ${cleanMsg.slice(0, 220)}`;
   if (status === 401) {
-    msg = `HTTP 401: Недействительный API-ключ Gemini (или истёк токен). Укажите корректный API-ключ Google AI Studio в настройках администратора.`;
+    msg = `HTTP 401: Недействительный API-ключ или истёк токен. Проверьте ключ в Settings > Secrets или в настройках администратора.`;
+  } else if (status === 403) {
+    msg = `HTTP 403: Доступ запрещён (${cleanMsg.slice(0, 180)}). Проверьте API-ключ.`;
   }
-  return Object.assign(new Error(msg), { status, body, daily: /PerDay|per day|daily/i.test(raw) });
+  const authInvalid = status === 401 || status === 403;
+  const leaked = /reported\s+as\s+leaked|key\s+was\s+leaked|\bleaked\b/i.test(cleanMsg);
+  return Object.assign(new Error(msg), { status, body, authInvalid, leaked, daily: /PerDay|per day|daily/i.test(raw) });
+}
+function extractReadableGeminiMessage(rawInput: any): string {
+  let cur = String(rawInput || "").trim();
+  for (let depth = 0; depth < 4; depth++) {
+    if (!cur || (cur[0] !== "{" && cur[0] !== "[")) break;
+    try {
+      const parsed = JSON.parse(cur);
+      const next = parsed?.error?.message ?? parsed?.message ?? (Array.isArray(parsed) ? parsed[0]?.error?.message || parsed[0]?.message : undefined);
+      if (typeof next === "string" && next.trim() && next.trim() !== cur) {
+        cur = next.trim();
+        continue;
+      }
+      break;
+    } catch {
+      break;
+    }
+  }
+  return cur;
 }
 function parseGeminiErrorDetails(err: any) {
   const isAbort = err?.name === "AbortError" || /aborted/i.test(String(err?.message || ""));
   const causeCode = String(err?.cause?.code || "").trim();
   const causeMsg = String(err?.cause?.message || "").trim();
   const baseMsg = String(err?.message || err || "");
-  const causeSuffix = !isAbort && (causeCode || causeMsg) && !baseMsg.includes(causeMsg || causeCode)
+  const cleanInner = extractReadableGeminiMessage(baseMsg);
+  const combinedText = `${cleanInner} ${baseMsg}`;
+  const causeSuffix = !isAbort && (causeCode || causeMsg) && !cleanInner.includes(causeMsg || causeCode)
     ? ` (${[causeCode, causeMsg].filter(Boolean).join(": ")})`
     : "";
-  const msg = isAbort ? "Превышен таймаут ожидания ответа от Gemini API" : `${baseMsg}${causeSuffix}`;
   let status = isAbort ? 408 : Number(err?.status || (err?.code && Number(err.code) >= 100 ? err.code : 0) || 0);
   if (!status) {
-    const m = msg.match(/"code"\s*:\s*(\d{3})/) || msg.match(/\bHTTP\s+(\d{3})\b/i) || msg.match(/\bstatus(?:\s+code)?[:\s]+(\d{3})\b/i);
+    const m = combinedText.match(/"code"\s*:\s*(\d{3})/) || combinedText.match(/\bHTTP\s+(\d{3})\b/i) || combinedText.match(/\bstatus(?:\s+code)?[:\s]+(\d{3})\b/i);
     if (m) status = Number(m[1]);
   }
-  if (!status && /API_KEY_INVALID|API key not valid/i.test(msg)) status = 400;
-  if (!status && /PERMISSION_DENIED/i.test(msg)) status = 403;
-  if (!status && /RESOURCE_EXHAUSTED|quota|rate.?limit/i.test(msg)) status = 429;
-  if (!status && /NOT_FOUND/i.test(msg)) status = 404;
-  const networkError = !isAbort && /fetch failed|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|UND_ERR_|socket hang up|network/i.test(msg);
+  if (!status && /API_KEY_INVALID|API key not valid/i.test(combinedText)) status = 400;
+  if (!status && /PERMISSION_DENIED/i.test(combinedText)) status = 403;
+  if (!status && /RESOURCE_EXHAUSTED|quota|rate.?limit/i.test(combinedText)) status = 429;
+  if (!status && /NOT_FOUND/i.test(combinedText)) status = 404;
+  const networkError = !isAbort && /fetch failed|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|UND_ERR_|socket hang up|network/i.test(combinedText);
   if (!status && networkError) {
-    status = /TIMEOUT|ETIMEDOUT/i.test(msg) ? 504 : 502;
+    status = /TIMEOUT|ETIMEDOUT/i.test(combinedText) ? 504 : 502;
   }
 
   let retryAfterMs = 0;
-  const rdMatch = msg.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i) || msg.match(/retry\s+in\s+(\d+(?:\.\d+)?)s/i);
+  const rdMatch = combinedText.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i) || combinedText.match(/retry\s+in\s+(\d+(?:\.\d+)?)s/i);
   if (rdMatch) {
     retryAfterMs = Math.max(5000, Math.ceil(Number(rdMatch[1]) * 1000));
   }
-  const daily = /PerDay|per day|daily|GenerateRequestsPerDay/i.test(msg);
-  const authInvalid = status === 401 || status === 403 || /API_KEY_INVALID|API key not valid|PERMISSION_DENIED/i.test(msg);
-  return { msg, status, retryAfterMs, daily, authInvalid, networkError };
+  const daily = /PerDay|per day|daily|GenerateRequestsPerDay/i.test(combinedText);
+  const leaked = /reported\s+as\s+leaked|key\s+was\s+leaked|\bleaked\b/i.test(combinedText);
+  const apiKeyInvalid = /API_KEY_INVALID|API key not valid/i.test(combinedText);
+  const authInvalid = status === 401 || status === 403 || leaked || apiKeyInvalid || /PERMISSION_DENIED/i.test(combinedText);
+
+  let msg = isAbort ? "Превышен таймаут ожидания ответа от Gemini API" : `${cleanInner || baseMsg}${causeSuffix}`;
+  if (leaked) {
+    msg = "API-ключ Gemini заблокирован Google как скомпрометированный (403 PERMISSION_DENIED: reported as leaked). Используйте другой GEMINI_API_KEY в Settings > Secrets или в настройках администратора.";
+  } else if (status === 401 || apiKeyInvalid) {
+    msg = `Недействительный API-ключ Gemini (${status || 400}). Проверьте или замените GEMINI_API_KEY в Settings > Secrets.`;
+  } else if (status === 403) {
+    msg = `Доступ к Gemini API запрещён (403 PERMISSION_DENIED): ${cleanInner || "проверьте ключ GEMINI_API_KEY в Settings > Secrets"}.`;
+  }
+  return { msg, rawMsg: baseMsg, status, retryAfterMs, daily, authInvalid, leaked, networkError };
 }
 var aiKeyStats = /* @__PURE__ */ new Map();
 function aiTodayStr() {
@@ -8422,7 +8458,7 @@ function ensureKeyStat(key: string) {
       lastUsedAt: Number(savedDaily?.lastUsedAt || 0),
       lastOkAt: Number(savedDaily?.lastOkAt || 0),
       lastErrorAt: Number(savedDaily?.lastErrorAt || 0),
-      lastErrorMsg: String(savedDaily?.lastErrorMsg || ""),
+      lastErrorMsg: extractReadableGeminiMessage(savedDaily?.lastErrorMsg || ""),
       lastErrorStatus: Number(savedDaily?.lastErrorStatus || 0),
       byModel: new Map<string, any>()
     };
@@ -8441,7 +8477,7 @@ function ensureKeyStat(key: string) {
           lastUsedAt: Number(mData?.lastUsedAt || 0),
           lastOkAt: Number(mData?.lastOkAt || 0),
           lastErrorAt: Number(mData?.lastErrorAt || 0),
-          lastErrorMsg: String(mData?.lastErrorMsg || ""),
+          lastErrorMsg: extractReadableGeminiMessage(mData?.lastErrorMsg || ""),
           lastErrorStatus: Number(mData?.lastErrorStatus || 0)
         });
       }
@@ -8691,6 +8727,7 @@ async function callProv(p, sys, user, o) {
                 status: d2.status,
                 daily: d2.daily,
                 authInvalid: d2.authInvalid,
+                leaked: d2.leaked,
                 networkError: d2.networkError,
                 retryAfterMs: d2.retryAfterMs
               });
@@ -8703,6 +8740,7 @@ async function callProv(p, sys, user, o) {
             status: d.status,
             daily: d.daily,
             authInvalid: d.authInvalid,
+            leaked: d.leaked,
             networkError: d.networkError,
             retryAfterMs: d.retryAfterMs
           });
@@ -8806,7 +8844,8 @@ function coolKeyId(key: string, model = ""): string {
 var coolKey = (p, e, modelOverride?: string) => {
   const now = Date.now();
   const model = modelOverride || (p?.n === "gemini" ? (p.model || getGeminiModel()) : (p?.model || ""));
-  const isAuth = !!(e.authInvalid || e.status === 401 || e.status === 403);
+  const isLeaked = !!(e.leaked || /reported\s+as\s+leaked|key\s+was\s+leaked|\bleaked\b/i.test(String(e.message || "")));
+  const isAuth = !!(e.authInvalid || isLeaked || e.status === 401 || e.status === 403);
   let streak = 1;
   if (model && !isAuth) {
     const prev = modelErrorStreak.get(model);
@@ -8840,11 +8879,20 @@ var coolKey = (p, e, modelOverride?: string) => {
     status: e.status || 0,
     daily: !!e.daily,
     authInvalid: isAuth,
+    leaked: isLeaked,
     notFound: e.status === 404,
     model,
     streak,
-    reason: String(e.message || "").slice(0, 160)
+    reason: String(e.message || "").slice(0, 220)
   });
+  if (isAuth && p?.n === "gemini" && p?.key && db?.settings) {
+    const kid = getKeyId(p.key);
+    const prevIds = Array.isArray(db.settings.lastAuthFailedKeyIds) ? db.settings.lastAuthFailedKeyIds : [];
+    if (!prevIds.includes(kid)) {
+      db.settings.lastAuthFailedKeyIds = [...prevIds.slice(-19), kid];
+      try { save(); } catch {}
+    }
+  }
 };
 function getCooldownUntil(entry: any): number {
   if (!entry) return 0;
@@ -8887,6 +8935,16 @@ function clearKeyCooldown(key: string, model?: string) {
 }
 function isKeyBlocked(key: string, now = Date.now(), model = getGeminiModel()): boolean {
   return !!getCooldownEntry(key, model, now);
+}
+function areAllProvidersAuthBlocked(now = Date.now()): boolean {
+  const all = provList();
+  if (!all.length) return false;
+  const gModel = getEffectiveGeminiModel(now);
+  for (const p of all) {
+    const kc = getCooldownEntry(p.key, p.n === "gemini" ? gModel : p.model, now);
+    if (!kc || !kc.authInvalid) return false;
+  }
+  return true;
 }
 async function llm(sys, user, { json = true, task = "", temp = 0.9, max = 16e3, grounded = false } = {}) {
   const cx = aiCtx.getStore();
@@ -8949,6 +9007,32 @@ async function llm(sys, user, { json = true, task = "", temp = 0.9, max = 16e3, 
   }
   if (!attempts.length) {
     cx.calls = Math.max(0, cx.calls - 1);
+    const activeCooldowns = [
+      ...gProvs.map((p) => getCooldownEntry(p.key, effectiveModel, now)),
+      ...otherProvs.map((p) => getCooldownEntry(p.key, p.model, now))
+    ].filter(Boolean);
+    const hasQuotaCooldown = activeCooldowns.some((kc: any) => kc?.daily || kc?.status === 429);
+    const hasAuthCooldown = activeCooldowns.some((kc: any) => kc?.authInvalid);
+    const hasLeakedCooldown = activeCooldowns.some((kc: any) => kc?.leaked);
+    const hasNotFoundCooldown = activeCooldowns.some((kc: any) => kc?.notFound);
+    if (!hasQuotaCooldown && hasAuthCooldown) {
+      if (hasLeakedCooldown) {
+        throw Object.assign(
+          new Error("API-ключ Gemini заблокирован Google как скомпрометированный (403 PERMISSION_DENIED: reported as leaked). Замените GEMINI_API_KEY в Settings > Secrets или в настройках администратора."),
+          { status: 403, authInvalid: true, leaked: true }
+        );
+      }
+      throw Object.assign(
+        new Error("Все доступные API-ключи ИИ отклонены (401/403 PERMISSION_DENIED). Проверьте GEMINI_API_KEY в Settings > Secrets или в настройках администратора."),
+        { status: 403, authInvalid: true }
+      );
+    }
+    if (!hasQuotaCooldown && hasNotFoundCooldown) {
+      throw Object.assign(
+        new Error("Выбранная модель Gemini не найдена (404 NOT_FOUND). Выберите актуальную модель в настройках ИИ."),
+        { status: 404 }
+      );
+    }
     throw Object.assign(
       new Error("Квота всех доступных моделей ИИ исчерпана (429 RESOURCE_EXHAUSTED). Подождите сброса лимита, переключите модель в настройках или используйте платный API-ключ."),
       { status: 429, daily: true, quotaExhausted: true }
@@ -12177,11 +12261,21 @@ async function runMatch(id, opts = {}) {
       }
     } catch (e: any) {
       if (!stillValid()) return;
-      const isQuotaOrAuth = !!(e?.daily || e?.quotaExhausted || e?.authInvalid || e?.status === 429 || e?.status === 401 || e?.status === 403);
+      const rawErrStr = String(e?.message || e);
+      const isLeaked = !!(e?.leaked || /reported\s+as\s+leaked|key\s+was\s+leaked|\bleaked\b/i.test(rawErrStr));
+      const isQuotaOrAuth = !!(e?.daily || e?.quotaExhausted || e?.authInvalid || isLeaked || e?.status === 429 || e?.status === 401 || e?.status === 403);
       const errText = (e?.status === 429 || e?.daily || e?.quotaExhausted)
         ? "Превышена квота ИИ (429 RESOURCE_EXHAUSTED). Подождите сброса лимита, смените модель или добавьте ключ в настройках."
-        : String(e?.message || e);
-      console.error("матч не удалось сгенерировать:", errText);
+        : (e?.authInvalid || isLeaked || e?.status === 401 || e?.status === 403)
+          ? (isLeaked
+              ? "API-ключ Gemini заблокирован как скомпрометированный (403 PERMISSION_DENIED: leaked). Замените GEMINI_API_KEY в Settings > Secrets или в настройках администратора."
+              : "Ошибка API-ключа ИИ (401/403 PERMISSION_DENIED). Проверьте GEMINI_API_KEY в Settings > Secrets или в настройках администратора.")
+          : extractReadableGeminiMessage(rawErrStr);
+      if (isQuotaOrAuth) {
+        console.warn("матч не удалось сгенерировать:", errText);
+      } else {
+        console.error("матч не удалось сгенерировать:", errText);
+      }
       f.aiCalls = store.calls;
       f.status = "scheduled";
       f._genToken = null;
@@ -12190,7 +12284,7 @@ async function runMatch(id, opts = {}) {
       f.err = errText;
       if (!opts.manual) {
         f.autoRetries = (f.autoRetries || 0) + 1;
-        if (e.noLLM || e.authInvalid || e.daily || e.quotaExhausted || (isQuotaOrAuth && f.autoRetries >= 1) || f.autoRetries >= 3) {
+        if (e.noLLM || e.authInvalid || isLeaked || e.daily || e.quotaExhausted || (isQuotaOrAuth && f.autoRetries >= 1) || f.autoRetries >= 3) {
           f.noAuto = true;
           f.autoRetryAt = 0;
         } else {
@@ -13086,9 +13180,10 @@ function nowMskParts() {
     };
   }
 }
+const TG_DAILY_ALLOWED_COMPS = new Set(["rpl", "cup"]);
 function buildTodayMatchesTgMessage(dateStr: string) {
   const list = (db?.fixtures || [])
-    .filter((f) => f && (f.realDate || f.date) === dateStr && f.status !== "cancelled")
+    .filter((f) => f && TG_DAILY_ALLOWED_COMPS.has(String(f.comp || "")) && (f.realDate || f.date) === dateStr && f.status !== "cancelled")
     .sort((a, b) => String(a.realTime || a.time || "12:00").localeCompare(String(b.realTime || b.time || "12:00")) || String(a.comp || "").localeCompare(String(b.comp || "")));
   if (!list.length) return { count: 0, text: "" };
   const byGroup = new Map<string, any[]>();
@@ -18744,6 +18839,7 @@ app.post("/api/admin/ai/reset-cooldowns", admin, (req, res) => {
     keyCooldown.clear();
     modelErrorStreak.clear();
     stickyFallbackModel = null;
+    if (clearStaleFixtureAiErrors()) save();
   } else {
     const match = getGeminiKeysWithMeta().find((k) => k.keyId === keyId);
     if (match) {
@@ -18779,7 +18875,7 @@ app.post("/api/admin/ai/test-key", admin, async (req, res) => {
       if (e?.authInvalid || e?.status === 401 || e?.status === 403 || e?.status === 429 || e?.status === 404 || e?.status >= 500 || e?.name === "AbortError") {
         coolKey({ n: "gemini", key: km.key, model }, e, model);
       }
-      results.push({ keyId: km.keyId, tail: km.tail, model, ok: false, ms: elapsed, status: e?.status || 0, error: String(e?.message || e).slice(0, 180) });
+      results.push({ keyId: km.keyId, tail: km.tail, model, ok: false, ms: elapsed, status: e?.status || 0, error: String(e?.message || e).slice(0, 260) });
     }
   }
   res.json({ ok: 1, results, status: buildAdminAiStatusPayload() });
@@ -18852,6 +18948,10 @@ app.post("/api/admin/settings", admin, (req, res) => {
   keyCooldown.clear();
   if (Object.keys(secUpdates).length > 0) {
     saveSecretsFile(secUpdates);
+    if (secUpdates.geminiKeys !== void 0) {
+      db.settings.lastAuthFailedKeyIds = [];
+      clearStaleFixtureAiErrors();
+    }
   }
   save();
   if (s.auto) setTimeout(runAutoStartTick, 50);
@@ -18920,7 +19020,7 @@ app.post("/api/admin/telegram/send-today", admin, (req, res) => {
     tg(digest.text);
     return res.json({ ok: 1, count: digest.count, message: `Отправлено расписание на ${ruDateStr(dateStr)} (${digest.count} матчей)` });
   }
-  return res.json({ ok: 1, count: 0, message: `На ${ruDateStr(dateStr)} матчей не запланировано` });
+  return res.json({ ok: 1, count: 0, message: `На ${ruDateStr(dateStr)} матчей РПЛ и Кубка России не запланировано` });
 });
 app.post("/api/admin/season", admin, (req, res) => {
   let start = String(req.body.start || "");
@@ -21508,6 +21608,8 @@ var pubFriendly = (r) => {
     budget: r.budget,
     formattedBudget: fmtEuro(r.budget),
     nationalType: r.nationalType || "",
+    adsSpent: Number(r.adsSpent || 0),
+    adsRefund: r.nationalType ? NT_FRIENDLY_REFUND_ADS : 0,
     needOpponentApproval: !!r.needOpponentApproval,
     opponentApproval: r.opponentApproval,
     adminApproval: r.adminApproval,
@@ -21653,7 +21755,7 @@ function ntFriendlyInfo(tid) {
     const brks = upcomingFriendlyBreaks().filter((b) => ntBreakHasMatches(type, b));
     return { type, id: NT_TID[type], name: t?.name || (type === "u21" ? "Сборная России U21" : "Сборная России"), logo: teamLogo(NT_TID[type]), squadSize: ntActiveIds(type).length, breaks: brks };
   });
-  return { ads: getNtFriendlyAdSummary(db, tid), teams, requiredAds: NT_FRIENDLY_REQUIRED_ADS };
+  return { ads: getNtFriendlyAdSummary(db, tid), teams, requiredAds: NT_FRIENDLY_REQUIRED_ADS, refundAds: NT_FRIENDLY_REFUND_ADS };
 }
 function friendlyForClub(tid) {
   expireFriendlies();
@@ -21832,7 +21934,7 @@ app.post("/api/club/friendly/national/request", needClub, (req, res) => {
     tg(`🇷🇺 <b>Заявка на матч со сборной</b>\n«${esc(A.name)}» — «${esc(B.name)}»\n🎮 Игровое: <b>${esc(gameDate)} ${esc(gameTime)}</b>\n⏰ Настоящее: <b>${esc(realDate)} ${esc(realTime)} МСК</b>\n📺 Оплачено просмотрами рекламы: ${NT_FRIENDLY_REQUIRED_ADS}\n<i>${esc(conditions)}</i>`);
   } catch {
   }
-  res.json({ ok: 1, request: pubFriendly(r), message: "Заявка отправлена администратору. Если её отклонят — 100 просмотров вернутся на счёт клуба.", ads: getNtFriendlyAdSummary(db, A.id) });
+  res.json({ ok: 1, request: pubFriendly(r), message: `Заявка отправлена администратору. При отказе или отклонении на счёт клуба вернутся ${NT_FRIENDLY_REFUND_ADS} просмотров.`, ads: getNtFriendlyAdSummary(db, A.id) });
 });
 app.post("/api/club/friendly/respond", needClub, (req, res) => {
   expireFriendlies();
@@ -21847,7 +21949,7 @@ app.post("/api/club/friendly/respond", needClub, (req, res) => {
     r.rejectReason = `\u0417\u0430\u044F\u0432\u043A\u0430 \u043E\u0442\u043E\u0437\u0432\u0430\u043D\u0430 \u043A\u043B\u0443\u0431\u043E\u043C \xAB${tn(r.clubId)}\xBB`;
     r.resolvedAt = (/* @__PURE__ */ new Date()).toISOString();
     save();
-    return res.json({ ok: 1, message: "\u0417\u0430\u044F\u0432\u043A\u0430 \u043E\u0442\u043E\u0437\u0432\u0430\u043D\u0430" });
+    return res.json({ ok: 1, message: r.nationalType ? `Заявка отозвана, на счёт клуба возвращено ${NT_FRIENDLY_REFUND_ADS} просмотров` : "\u0417\u0430\u044F\u0432\u043A\u0430 \u043E\u0442\u043E\u0437\u0432\u0430\u043D\u0430" });
   }
   if (r.opponentId !== req.tid || !r.needOpponentApproval) return fail(res, "\u042D\u0442\u0430 \u0437\u0430\u044F\u0432\u043A\u0430 \u043D\u0435 \u0442\u0440\u0435\u0431\u0443\u0435\u0442 \u0432\u0430\u0448\u0435\u0433\u043E \u043E\u0442\u0432\u0435\u0442\u0430");
   if (r.opponentApproval !== "pending") return fail(res, "\u0412\u044B \u0443\u0436\u0435 \u043E\u0442\u0432\u0435\u0442\u0438\u043B\u0438 \u043D\u0430 \u044D\u0442\u0443 \u0437\u0430\u044F\u0432\u043A\u0443");
@@ -21911,7 +22013,7 @@ app.post("/api/admin/friendly/resolve", admin, (req, res) => {
     r.rejectReason = cleanTxt(comment, 200) || "\u041E\u0442\u043A\u043B\u043E\u043D\u0435\u043D\u043E \u0430\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440\u043E\u043C";
     r.resolvedAt = (/* @__PURE__ */ new Date()).toISOString();
     save();
-    return res.json({ ok: 1, rejected: true, message: "\u0417\u0430\u044F\u0432\u043A\u0430 \u043E\u0442\u043A\u043B\u043E\u043D\u0435\u043D\u0430" });
+    return res.json({ ok: 1, rejected: true, message: r.nationalType ? `Заявка отклонена, клубу возвращено ${NT_FRIENDLY_REFUND_ADS} просмотров` : "\u0417\u0430\u044F\u0432\u043A\u0430 \u043E\u0442\u043A\u043B\u043E\u043D\u0435\u043D\u0430" });
   }
   return fail(res, "\u041D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u043E\u0435 \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0435");
 });
@@ -23277,20 +23379,69 @@ if (!db.settings.nationalFriendliesAndSquadsClearedV1) {
   saveNow();
   console.log(`[national] Очищены товарищеские матчи и составы сборных (клубных удалено: ${purged})`);
 }
-if (!db.settings.clearStale429ErrorsV1) {
-  let clearedErrs = 0;
+function clearStaleFixtureAiErrors(): number {
+  let cleared = 0;
   for (const f of db.fixtures || []) {
-    if (f && f.status === "scheduled" && f.err && /429|RESOURCE_EXHAUSTED|quota/i.test(String(f.err))) {
+    if (f && f.status === "scheduled" && f.err && /429|401|403|RESOURCE_EXHAUSTED|PERMISSION_DENIED|API_KEY_INVALID|leaked|quota|API-ключ/i.test(String(f.err))) {
       f.err = "";
       f.autoRetries = 0;
       f.autoRetryAt = 0;
       f.noAuto = false;
-      clearedErrs++;
+      cleared++;
     }
   }
+  return cleared;
+}
+if (!db.settings.clearStale429ErrorsV1) {
+  const clearedErrs = clearStaleFixtureAiErrors();
   db.settings.clearStale429ErrorsV1 = true;
   if (clearedErrs > 0) console.log(`[ai] Очищены старые ошибки квоты 429 у матчей: ${clearedErrs}`);
   saveNow();
+}
+{
+  // Clean raw JSON error messages from earlier failed fixtures & auto-recover if the active Gemini key changed
+  let normChanged = false;
+  for (const f of db.fixtures || []) {
+    if (f && f.status === "scheduled" && f.err && /^\s*\{/.test(String(f.err))) {
+      const cleanMsg = extractReadableGeminiMessage(f.err);
+      if (/reported\s+as\s+leaked|\bleaked\b/i.test(cleanMsg)) {
+        f.err = "API-ключ Gemini заблокирован как скомпрометированный (403 PERMISSION_DENIED: leaked). Замените GEMINI_API_KEY в Settings > Secrets или в настройках администратора.";
+        normChanged = true;
+      } else if (/PERMISSION_DENIED|API_KEY_INVALID|401|403/i.test(cleanMsg)) {
+        f.err = "Ошибка API-ключа ИИ (401/403 PERMISSION_DENIED). Проверьте GEMINI_API_KEY в Settings > Secrets или в настройках администратора.";
+        normChanged = true;
+      } else if (cleanMsg !== f.err) {
+        f.err = cleanMsg;
+        normChanged = true;
+      }
+    }
+  }
+  const todayUsageKeys = db.settings?.aiUsageDaily?.[aiTodayStr()]?.keys;
+  if (todayUsageKeys && typeof todayUsageKeys === "object") {
+    db.settings.lastAuthFailedKeyIds ||= [];
+    for (const [kid, kData] of Object.entries(todayUsageKeys as Record<string, any>)) {
+      if (kData?.lastErrorMsg && /^\s*\{/.test(String(kData.lastErrorMsg))) {
+        kData.lastErrorMsg = extractReadableGeminiMessage(kData.lastErrorMsg);
+        normChanged = true;
+      }
+      if ((kData?.lastErrorStatus === 401 || kData?.lastErrorStatus === 403) && !(Number(kData?.lastOkAt || 0) > Number(kData?.lastErrorAt || 0))) {
+        if (!db.settings.lastAuthFailedKeyIds.includes(kid)) {
+          db.settings.lastAuthFailedKeyIds.push(kid);
+          normChanged = true;
+        }
+      }
+    }
+  }
+  const activeKeyIds = getGeminiKeysWithMeta().map((k) => k.keyId);
+  const failedIds = Array.isArray(db.settings.lastAuthFailedKeyIds) ? db.settings.lastAuthFailedKeyIds : [];
+  const hasNewWorkingCandidate = activeKeyIds.some((id) => !failedIds.includes(id));
+  if (failedIds.length > 0 && hasNewWorkingCandidate) {
+    const cleared = clearStaleFixtureAiErrors();
+    db.settings.lastAuthFailedKeyIds = [];
+    if (cleared > 0) console.log(`[ai] Обнаружен новый API-ключ — сброшены ошибки у матчей: ${cleared}`);
+    normChanged = true;
+  }
+  if (normChanged) saveNow();
 }
 {
   const exp = expireFriendlies();
@@ -23310,6 +23461,7 @@ invalidateAgg();
 resumeLive();
 function runAutoStartTick() {
   if (!db?.settings?.auto) return;
+  if (areAllProvidersAuthBlocked()) return;
   const now = Date.now(), lead = (db.settings.aiLeadSec !== void 0 ? +db.settings.aiLeadSec : 60) * 1e3;
   for (const f of db.fixtures || []) {
     if (f.season && f.season !== S()) continue;

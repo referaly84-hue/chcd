@@ -7198,27 +7198,44 @@ async function pgClub(app) {
       </div>`;
     const nowFr = Date.now();
     const ntInfo = fr.national || { teams: [], ads: null };
-    const ntAds = ntInfo.ads || { required: 100, points: 0, ready: false, dailyLimit: 30, dailyUsed: 0, limitReached: false, cooldownMs: 180000, cooldownRemainingMs: 0, nextAvailableAt: null, blockKeys: ['nt_friendly_a', 'nt_friendly_b'] };
+    const ntAds = ntInfo.ads || { required: 100, refundAds: 80, points: 0, ready: false, dailyLimit: 30, dailyUsed: 0, limitReached: false, cooldownMs: 180000, cooldownRemainingMs: 0, nextAvailableAt: null, blocks: {}, blockKeys: ['nt_friendly_a', 'nt_friendly_b'] };
     const ntTeams = ntInfo.teams || [];
-    const ntCdTarget = Number(ntAds.nextAvailableAt || 0) || (Number(ntAds.cooldownRemainingMs || 0) > 0 ? nowFr + Number(ntAds.cooldownRemainingMs) : 0);
-    const ntInCd = ntCdTarget > nowFr;
+    const ntBlocks = ntAds.blocks || {};
+    const getNtBlock = (bk) => {
+      const b = ntBlocks[bk] || {};
+      const dailyLimit = Number(b.dailyLimit || ntAds.dailyLimit || 30);
+      const dailyUsed = Number(b.dailyUsed || 0);
+      const limitReached = !!b.limitReached || dailyUsed >= dailyLimit;
+      const cdTarget = limitReached ? 0 : (Number(b.nextAvailableAt || 0) || (Number(b.cooldownRemainingMs || 0) > 0 ? nowFr + Number(b.cooldownRemainingMs) : 0));
+      const inCd = cdTarget > nowFr;
+      const disabled = limitReached || inCd;
+      return { dailyLimit, dailyUsed, limitReached, cdTarget, inCd, disabled };
+    };
+    const ntBlkA = getNtBlock('nt_friendly_a');
+    const ntBlkB = getNtBlock('nt_friendly_b');
+    const ntAnyCd = ntBlkA.inCd || ntBlkB.inCd;
+    const ntAllLimited = ntBlkA.limitReached && ntBlkB.limitReached;
+    const ntOneLimited = !ntAllLimited && (ntBlkA.limitReached || ntBlkB.limitReached);
+    const ntRefund = Number(ntAds.refundAds || ntInfo.refundAds || 80);
     const ntPct = Math.min(100, Math.round((ntAds.points / ntAds.required) * 100));
-    const ntWatchOff = ntAds.ready || ntAds.limitReached || ntInCd;
     const ntFmtCd = (ms) => { const sec = Math.max(1, Math.ceil(ms / 1000)); return String(Math.floor(sec / 60)).padStart(2, '0') + ':' + String(sec % 60).padStart(2, '0'); };
     const ntPanel = `
       <div class="panel" id="nt_panel" style="margin-top:12px;border:1.5px solid #bfdbfe">
         <h3 style="margin:0 0 4px">🇷🇺 Товарищеский матч со сборной России / U21</h3>
-        <p class="muted small" style="margin:0 0 8px">Заявка стоит <b>${ntAds.required} просмотров рекламы</b> (два рекламных блока суммируются). Не больше <b>${ntAds.dailyLimit}</b> просмотров в сутки, перерыв между просмотрами — <b>3 минуты</b>. Решает администратор; если заявку отклонят или она истечёт, ${ntAds.required} просмотров вернутся. Пока игрок вызван в сборную, он не играет за клуб ни в одном матче паузы (в том числе в товарищеских).</p>
+        <p class="muted small" style="margin:0 0 8px">Заявка стоит <b>${ntAds.required} просмотров рекламы</b>. Просмотры накапливаются на счёте клуба и списываются только при подаче заявки — после набора ${ntAds.required} можно дальше смотреть и копить просмотры. Лимит — <b>${ntAds.dailyLimit || 30} просмотров в сутки на каждый блок отдельно</b>, перерыв между просмотрами блока — <b>3 минуты</b>. Решает администратор; при отказе или отклонении заявки возвращается <b>${ntRefund} просмотров</b> (а не ${ntAds.required}). Пока игрок вызван в сборную, он не играет за клуб ни в одном матче паузы (в том числе в товарищеских).</p>
         <div style="background:var(--soft);border:1px solid var(--border);border-radius:8px;padding:10px">
-          <div class="row sp" style="gap:8px;flex-wrap:wrap"><b>Набрано: ${ntAds.points} / ${ntAds.required}</b><span class="muted small">Сегодня: ${ntAds.dailyUsed} / ${ntAds.dailyLimit}</span></div>
-          <div style="height:10px;background:#e2e8f0;border-radius:6px;margin:6px 0;overflow:hidden"><div style="height:100%;width:${ntPct}%;background:#2563eb"></div></div>
-          <div class="row" style="gap:8px;flex-wrap:wrap">
-            <button type="button" class="btn sm" data-nt-watch="nt_friendly_a" ${ntWatchOff ? 'disabled' : ''}>▶ Смотреть рекламу (1)</button>
-            <button type="button" class="btn sm alt" data-nt-watch="nt_friendly_b" ${ntWatchOff ? 'disabled' : ''}>▶ Смотреть рекламу (2)</button>
-            ${ntInCd ? `<span class="small" style="align-self:center;font-variant-numeric:tabular-nums">Перерыв: <b data-nt-cd="${ntCdTarget}">${ntFmtCd(ntCdTarget - nowFr)}</b></span>` : ''}
+          <div class="row sp" style="gap:8px;flex-wrap:wrap">
+            <b>На счёте клуба: ${ntAds.points} просм. <span class="muted small" style="font-weight:400">(на заявку: ${ntAds.required})</span></b>
+            <span class="muted small">Блок 1: ${ntBlkA.dailyUsed}/${ntBlkA.dailyLimit} · Блок 2: ${ntBlkB.dailyUsed}/${ntBlkB.dailyLimit}</span>
           </div>
-          ${ntAds.limitReached ? '<div class="small" style="margin-top:6px;color:#991b1b">Дневной лимит исчерпан — продолжите позже.</div>' : ''}
-          ${ntAds.ready ? '<div class="small" style="margin-top:6px;color:#166534">Просмотры набраны — можно подавать заявку ниже.</div>' : ''}
+          <div style="height:10px;background:#e2e8f0;border-radius:6px;margin:6px 0;overflow:hidden"><div style="height:100%;width:${ntPct}%;background:${ntAds.ready ? '#16a34a' : '#2563eb'}"></div></div>
+          <div class="row" style="gap:8px;flex-wrap:wrap">
+            <button type="button" class="btn sm" data-nt-watch="nt_friendly_a" ${ntBlkA.disabled ? 'disabled' : ''} style="font-variant-numeric:tabular-nums">▶ Смотреть рекламу (1) · ${ntBlkA.dailyUsed}/${ntBlkA.dailyLimit}${ntBlkA.inCd ? ` (<span data-nt-cd="${ntBlkA.cdTarget}">${ntFmtCd(ntBlkA.cdTarget - nowFr)}</span>)` : ntBlkA.limitReached ? ' (лимит)' : ''}</button>
+            <button type="button" class="btn sm alt" data-nt-watch="nt_friendly_b" ${ntBlkB.disabled ? 'disabled' : ''} style="font-variant-numeric:tabular-nums">▶ Смотреть рекламу (2) · ${ntBlkB.dailyUsed}/${ntBlkB.dailyLimit}${ntBlkB.inCd ? ` (<span data-nt-cd="${ntBlkB.cdTarget}">${ntFmtCd(ntBlkB.cdTarget - nowFr)}</span>)` : ntBlkB.limitReached ? ' (лимит)' : ''}</button>
+          </div>
+          ${ntAllLimited ? '<div class="small" style="margin-top:6px;color:#991b1b">Дневной лимит обоих блоков исчерпан (30/30 на каждый) — продолжите позже.</div>' : ''}
+          ${ntOneLimited ? '<div class="small" style="margin-top:6px;color:#92400e">Лимит одного из блоков на сегодня исчерпан — можно продолжать смотреть второй блок.</div>' : ''}
+          ${ntAds.ready ? `<div class="small" style="margin-top:6px;color:#166534">Достаточно просмотров для заявки (${ntAds.points} на счёте) — можно подавать заявку ниже и продолжать копить просмотры.</div>` : ''}
         </div>
         ${ntTeams.length ? `
         <div class="row" style="gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">
@@ -7357,13 +7374,18 @@ async function pgClub(app) {
     const ntBox = cb.querySelector('#nt_panel');
     if (ntBox) {
       const q = (sel) => ntBox.querySelector(sel);
-      if (ntInCd) {
+      if (ntAnyCd) {
         window.__ntCdTimer = setInterval(() => {
-          const el = ntBox.querySelector('[data-nt-cd]');
-          if (!document.body.contains(ntBox) || !el) { clearInterval(window.__ntCdTimer); window.__ntCdTimer = null; return; }
-          const rem = Number(el.dataset.ntCd) - Date.now();
-          if (rem > 0) el.textContent = ntFmtCd(rem);
-          else { clearInterval(window.__ntCdTimer); window.__ntCdTimer = null; setTimeout(() => pgClub(app), 300); }
+          const els = ntBox.querySelectorAll('[data-nt-cd]');
+          if (!document.body.contains(ntBox) || !els.length) { clearInterval(window.__ntCdTimer); window.__ntCdTimer = null; return; }
+          const nowTick = Date.now();
+          let needReload = false;
+          els.forEach((el) => {
+            const rem = Number(el.dataset.ntCd) - nowTick;
+            if (rem > 0) el.textContent = ntFmtCd(rem);
+            else needReload = true;
+          });
+          if (needReload) { clearInterval(window.__ntCdTimer); window.__ntCdTimer = null; setTimeout(() => pgClub(app), 300); }
         }, 1000);
       }
       ntBox.querySelectorAll('[data-nt-watch]').forEach(b => b.onclick = async () => {
@@ -7373,7 +7395,7 @@ async function pgClub(app) {
         const adRes = await ext.runAdsgramBlock(
           blockKey,
           'Матч со сборной России',
-          'Досмотрите рекламу до конца — просмотр засчитается в счётчик заявки.',
+          'Досмотрите рекламу до конца — просмотр зачислится на счёт клуба.',
           { teamId: CLUB_TID }
         );
         if (!adRes) return;
@@ -7438,7 +7460,7 @@ async function pgClub(app) {
       if (r) pgClub(app);
     });
     cb.querySelectorAll('[data-fr-no]').forEach(b => b.onclick = async () => { const r = await act(() => api('/club/friendly/respond', withT({ requestId: b.dataset.frNo, action: 'reject' })), 'Приглашение отклонено'); if (r) pgClub(app); });
-    cb.querySelectorAll('[data-fr-cancel]').forEach(b => b.onclick = async () => { const r = await act(() => api('/club/friendly/respond', withT({ requestId: b.dataset.frCancel, action: 'cancel' })), 'Заявка отозвана'); if (r) pgClub(app); });
+    cb.querySelectorAll('[data-fr-cancel]').forEach(b => b.onclick = async () => { const r = await act(() => api('/club/friendly/respond', withT({ requestId: b.dataset.frCancel, action: 'cancel' })), d => d?.message || 'Заявка отозвана'); if (r) pgClub(app); });
     if ($('#fr_send')) {
       const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Moscow' });
       if ($('#fr_real_date') && !$('#fr_real_date').value) {
@@ -12034,7 +12056,7 @@ async function pgAdmin(app) {
 <div class="small" style="margin:4px 0">
   🎮 <b>Игровое:</b> ${e(r.gameDate || r.date)} ${e(r.gameTime || r.time)} · 
   ⏰ <b>Настоящее:</b> ${e(r.realDate || r.date)} ${e(r.realTime || r.time || '19:00')} МСК · 
-  ${e(r.venueText)}${r.venue === 'neutral' ? ` (${e(r.stadium)}${r.city ? ', ' + e(r.city) : ''})` : ''} · 💶 <b>${e(r.formattedBudget)}</b>
+  ${e(r.venueText)}${r.venue === 'neutral' ? ` (${e(r.stadium)}${r.city ? ', ' + e(r.city) : ''})` : ''} · ${r.nationalType ? `📺 <b>${r.adsSpent || 100} просм. рекламы</b>` : '💶 <b>' + e(r.formattedBudget) + '</b>'}
 </div>
 <div class="small">Условия: ${e(r.conditions)}</div>
 <div class="muted small">Админ: ${appr(r.adminApproval)} · Клуб-соперник: ${r.needOpponentApproval ? appr(r.opponentApproval) : 'не требуется (не РПЛ)'}</div>`;
@@ -13236,7 +13258,7 @@ async function pgAdmin(app) {
     <div class="panel"><h3>Трансляция и Telegram</h3><div class="row"><div style="flex:1;min-width:200px"><label>Секунд реального времени на минуту матча</label><input id="spm" type="number" step="0.5" value="${s.secPerMin}"></div><div style="flex:1;min-width:200px"><label>Пауза на перерыве, сек</label><input id="brk" type="number" value="${s.breakSec}"></div></div>
     <div class="row"><div style="flex:1;min-width:220px"><label>Токен Telegram-бота</label><input id="tgt" type="password" value="${e(s.tgToken)}" placeholder="123456:ABC…"></div><div style="flex:1;min-width:200px"><label>ID канала или чата</label><input id="tgc" value="${e(s.tgChat)}" placeholder="@matchsmotr"></div></div>
     <div class="row sp" style="margin-top:10px;align-items:center;flex-wrap:wrap;gap:8px">
-      <span class="muted small">💡 Все события матчей, трансферы, серии пенальти, расписание на день в 00:00 МСК и сборная тура отправляются в Telegram. Бот должен быть администратором канала.</span>
+      <span class="muted small">💡 Все события матчей, трансферы, серии пенальти, расписание РПЛ и Кубка России на день в 00:00 МСК и сборная тура отправляются в Telegram. Бот должен быть администратором канала.</span>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button type="button" class="btn alt sm" id="tg_today_btn">📅 Отправить матчи на сегодня</button>
         <button type="button" class="btn alt sm" id="tg_test_btn">🔔 Проверить отправку в Telegram</button>

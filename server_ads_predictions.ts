@@ -75,7 +75,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
   },
   {
     key: 'nt_friendly_a',
-    label: 'Матч со сборной России / U21 — Реклама 1 (в сумме 100 просмотров на матч)',
+    label: 'Матч со сборной России / U21 — Реклама 1 (лимит 30/сутки на блок, 100 на заявку)',
     category: 'friendly',
     format: 'long',
     durationSec: 15,
@@ -85,7 +85,7 @@ export const ADSGRAM_BLOCKS: AdsgramBlockDef[] = [
   },
   {
     key: 'nt_friendly_b',
-    label: 'Матч со сборной России / U21 — Реклама 2 (в сумме 100 просмотров на матч)',
+    label: 'Матч со сборной России / U21 — Реклама 2 (лимит 30/сутки на блок, 100 на заявку)',
     category: 'friendly',
     format: 'short',
     durationSec: 5,
@@ -282,11 +282,13 @@ function getCooldownLeftMs(lastAt: any): number {
 }
 
 /* ───────── Товарищеский матч со сборной России / U21: 100 реклам ─────────
-   Два блока (nt_friendly_a и nt_friendly_b) суммируются в один счётчик клуба.
-   Лимит — 30 просмотров за 24 часа (на клуб, оба блока вместе), пауза между просмотрами — 3 минуты.
-   Набранные просмотры хранятся в db.ntFriendlyAds[teamId].points и списываются при подаче заявки. */
+   Два блока (nt_friendly_a и nt_friendly_b) начисляются в общий счётчик клуба (st.points).
+   Лимит — 30 просмотров за 24 часа на КАЖДЫЙ блок отдельно, пауза между просмотрами блока — 3 минуты.
+   Просмотры накапливаются на счёте клуба (в том числе свыше 100) и списываются только при подаче заявки (100).
+   При отказе, отклонении, отзыве или истечении заявки возвращается 80 просмотров (а не 100). */
 export const NT_FRIENDLY_BLOCK_KEYS = ['nt_friendly_a', 'nt_friendly_b'] as const;
 export const NT_FRIENDLY_REQUIRED_ADS = 100;
+export const NT_FRIENDLY_REFUND_ADS = 80;
 export const NT_FRIENDLY_DAILY_LIMIT = 30;
 export const NT_FRIENDLY_COOLDOWN_MS = 3 * 60 * 1000;
 
@@ -294,60 +296,147 @@ function ensureNtFriendlyState(db: any, teamId: string) {
   db.ntFriendlyAds ||= {};
   let st = db.ntFriendlyAds[teamId];
   if (!st || typeof st !== 'object') {
-    st = { points: 0, total: 0, spent: 0, byBlock: {}, cycleStartedAt: 0, dayViews: 0, lastAdAt: 0 };
+    st = { points: 0, total: 0, spent: 0, byBlock: {}, blockCycles: {}, cycleStartedAt: 0, dayViews: 0, lastAdAt: 0 };
     db.ntFriendlyAds[teamId] = st;
   }
   const now = Date.now();
-  if (st.cycleStartedAt > 0 && now - st.cycleStartedAt >= CYCLE_MS) {
-    st.cycleStartedAt = 0;
-    st.dayViews = 0;
-  }
   st.points = Math.max(0, Number(st.points || 0));
   st.total = Math.max(0, Number(st.total || 0));
   st.spent = Math.max(0, Number(st.spent || 0));
-  st.dayViews = Math.max(0, Number(st.dayViews || 0));
   st.lastAdAt = Number(st.lastAdAt || 0);
   st.byBlock ||= {};
+
+  if (!st.blockCycles || typeof st.blockCycles !== 'object') {
+    st.blockCycles = {};
+    const legacyActive = Number(st.cycleStartedAt || 0) > 0 && now - Number(st.cycleStartedAt) < CYCLE_MS;
+    const legacyDayViews = legacyActive ? Math.max(0, Number(st.dayViews || 0)) : 0;
+    for (const bk of NT_FRIENDLY_BLOCK_KEYS) {
+      const seeded = legacyActive
+        ? Math.min(NT_FRIENDLY_DAILY_LIMIT, legacyDayViews, Math.max(0, Number(st.byBlock[bk] || 0)))
+        : 0;
+      st.blockCycles[bk] = {
+        cycleStartedAt: seeded > 0 ? Number(st.cycleStartedAt || 0) : 0,
+        dayViews: seeded,
+        lastAdAt: seeded > 0 ? st.lastAdAt : 0,
+      };
+    }
+  }
+
+  for (const bk of NT_FRIENDLY_BLOCK_KEYS) {
+    let bc = st.blockCycles[bk];
+    if (!bc || typeof bc !== 'object') {
+      bc = { cycleStartedAt: 0, dayViews: 0, lastAdAt: 0 };
+      st.blockCycles[bk] = bc;
+    }
+    bc.cycleStartedAt = Number(bc.cycleStartedAt || 0);
+    bc.dayViews = Math.max(0, Number(bc.dayViews || 0));
+    bc.lastAdAt = Number(bc.lastAdAt || 0);
+    if (bc.cycleStartedAt > 0 && now - bc.cycleStartedAt >= CYCLE_MS) {
+      bc.cycleStartedAt = 0;
+      bc.dayViews = 0;
+      bc.lastAdAt = 0;
+    }
+  }
   return st;
 }
 
 export function getNtFriendlyAdSummary(db: any, teamId: string) {
   const st = ensureNtFriendlyState(db, teamId);
   const now = Date.now();
-  const cdLeft = st.lastAdAt ? Math.max(0, st.lastAdAt + NT_FRIENDLY_COOLDOWN_MS - now) : 0;
-  const limitReached = st.dayViews >= NT_FRIENDLY_DAILY_LIMIT;
+  const blocks: Record<string, {
+    blockKey: string;
+    dailyLimit: number;
+    dailyUsed: number;
+    limitReached: boolean;
+    limitResetsAt: number | null;
+    cooldownMs: number;
+    cooldownRemainingMs: number;
+    nextAvailableAt: number | null;
+    totalViews: number;
+  }> = {};
+
+  let totalDailyUsed = 0;
+  let allLimitsReached = true;
+  let minCdLeft = 0;
+  let hasReadyBlock = false;
+
+  for (const bk of NT_FRIENDLY_BLOCK_KEYS) {
+    const bc = st.blockCycles[bk];
+    const dailyUsed = Math.min(NT_FRIENDLY_DAILY_LIMIT, bc.dayViews);
+    const limitReached = dailyUsed >= NT_FRIENDLY_DAILY_LIMIT;
+    const cdLeft = limitReached ? 0 : (bc.lastAdAt ? Math.max(0, bc.lastAdAt + NT_FRIENDLY_COOLDOWN_MS - now) : 0);
+    totalDailyUsed += dailyUsed;
+    if (!limitReached) {
+      allLimitsReached = false;
+      if (cdLeft === 0) hasReadyBlock = true;
+      else if (minCdLeft === 0 || cdLeft < minCdLeft) minCdLeft = cdLeft;
+    }
+    blocks[bk] = {
+      blockKey: bk,
+      dailyLimit: NT_FRIENDLY_DAILY_LIMIT,
+      dailyUsed,
+      limitReached,
+      limitResetsAt: limitReached && bc.cycleStartedAt ? bc.cycleStartedAt + CYCLE_MS : null,
+      cooldownMs: NT_FRIENDLY_COOLDOWN_MS,
+      cooldownRemainingMs: cdLeft,
+      nextAvailableAt: cdLeft > 0 ? now + cdLeft : null,
+      totalViews: Number(st.byBlock[bk] || 0),
+    };
+  }
+
+  const effectiveCd = hasReadyBlock ? 0 : minCdLeft;
+
   return {
     required: NT_FRIENDLY_REQUIRED_ADS,
-    points: Math.min(NT_FRIENDLY_REQUIRED_ADS, st.points),
+    refundAds: NT_FRIENDLY_REFUND_ADS,
+    points: st.points,
+    total: st.total,
+    spent: st.spent,
     ready: st.points >= NT_FRIENDLY_REQUIRED_ADS,
     dailyLimit: NT_FRIENDLY_DAILY_LIMIT,
-    dailyUsed: Math.min(NT_FRIENDLY_DAILY_LIMIT, st.dayViews),
-    limitReached,
-    limitResetsAt: limitReached && st.cycleStartedAt ? st.cycleStartedAt + CYCLE_MS : null,
+    dailyUsed: totalDailyUsed,
+    limitReached: allLimitsReached,
+    limitResetsAt: null,
     cooldownMs: NT_FRIENDLY_COOLDOWN_MS,
-    cooldownRemainingMs: cdLeft,
-    nextAvailableAt: cdLeft > 0 ? now + cdLeft : null,
+    cooldownRemainingMs: effectiveCd,
+    nextAvailableAt: effectiveCd > 0 ? now + effectiveCd : null,
+    blocks,
     byBlock: { ...st.byBlock },
     blockKeys: [...NT_FRIENDLY_BLOCK_KEYS],
   };
 }
 
-export function checkNtFriendlyAdAllowed(db: any, teamId: string): { ok: true } | { ok: false; error: string } {
+export function checkNtFriendlyAdAllowed(
+  db: any,
+  teamId: string,
+  blockKey?: string
+): { ok: true } | { ok: false; error: string } {
   const st = ensureNtFriendlyState(db, teamId);
-  if (st.points >= NT_FRIENDLY_REQUIRED_ADS) {
-    return { ok: false, error: `Уже набрано ${NT_FRIENDLY_REQUIRED_ADS} просмотров — подайте заявку на матч со сборной.` };
+  const bk = (NT_FRIENDLY_BLOCK_KEYS as readonly string[]).includes(String(blockKey || ''))
+    ? (blockKey as (typeof NT_FRIENDLY_BLOCK_KEYS)[number])
+    : null;
+  if (blockKey && !bk) {
+    return { ok: false, error: 'Неизвестный рекламный блок для матча со сборной.' };
   }
-  if (st.dayViews >= NT_FRIENDLY_DAILY_LIMIT) {
-    return { ok: false, error: `Дневной лимит исчерпан (${NT_FRIENDLY_DAILY_LIMIT}/${NT_FRIENDLY_DAILY_LIMIT}). Продолжите после обновления лимита.` };
+  const keysToCheck = bk ? [bk] : [...NT_FRIENDLY_BLOCK_KEYS];
+  let lastErr = '';
+  for (const k of keysToCheck) {
+    const bc = st.blockCycles[k];
+    if (bc.dayViews >= NT_FRIENDLY_DAILY_LIMIT) {
+      lastErr = `Дневной лимит этого блока исчерпан (${NT_FRIENDLY_DAILY_LIMIT}/${NT_FRIENDLY_DAILY_LIMIT}). Можно смотреть другой блок или дождаться обновления лимита.`;
+      continue;
+    }
+    const cdLeft = bc.lastAdAt ? Math.max(0, bc.lastAdAt + NT_FRIENDLY_COOLDOWN_MS - Date.now()) : 0;
+    if (cdLeft > 0) {
+      lastErr = `Перерыв между просмотрами этого блока: подождите ещё ${fmtCooldownWords(cdLeft)}.`;
+      continue;
+    }
+    return { ok: true };
   }
-  const cdLeft = st.lastAdAt ? Math.max(0, st.lastAdAt + NT_FRIENDLY_COOLDOWN_MS - Date.now()) : 0;
-  if (cdLeft > 0) {
-    return { ok: false, error: `Перерыв между просмотрами: подождите ещё ${fmtCooldownWords(cdLeft)}.` };
-  }
-  return { ok: true };
+  return { ok: false, error: lastErr || 'Реклама временно недоступна.' };
 }
 
-/** Засчитывает один просмотр (adProof от /api/ads/complete) в счётчик клуба. */
+/** Засчитывает один просмотр (adProof от /api/ads/complete) на счёт клуба. */
 export function creditNtFriendlyAd(
   ctx: AdServerContext,
   teamId: string,
@@ -359,14 +448,16 @@ export function creditNtFriendlyAd(
   if (!(NT_FRIENDLY_BLOCK_KEYS as readonly string[]).includes(blockKey)) {
     return { ok: false, error: 'Неизвестный рекламный блок для матча со сборной.' };
   }
-  const chk = checkNtFriendlyAdAllowed(db, teamId);
+  const chk = checkNtFriendlyAdAllowed(db, teamId, blockKey);
   if (!chk.ok) return chk;
   const v = verifyAndConsumeAdProof(adProof, blockKey, actorKey, false, actorKey.startsWith('club:') ? 'admin' : undefined);
   if (!v.ok) return v;
   const st = ensureNtFriendlyState(db, teamId);
+  const bc = st.blockCycles[blockKey];
   const now = Date.now();
-  if (!st.cycleStartedAt) st.cycleStartedAt = now;
-  st.dayViews += 1;
+  if (!bc.cycleStartedAt) bc.cycleStartedAt = now;
+  bc.dayViews += 1;
+  bc.lastAdAt = now;
   st.points += 1;
   st.total += 1;
   st.lastAdAt = now;
@@ -376,27 +467,27 @@ export function creditNtFriendlyAd(
     blockKey,
     blockId: getAdsgramBlocks(db)[blockKey] || blockKey,
     actorKey,
-    detail: `Матч со сборной: просмотр ${Math.min(st.points, NT_FRIENDLY_REQUIRED_ADS)}/${NT_FRIENDLY_REQUIRED_ADS}`,
+    detail: `Матч со сборной (${blockKey}): на счёте клуба ${st.points} просм. (блок ${bc.dayViews}/${NT_FRIENDLY_DAILY_LIMIT})`,
   });
   return { ok: true };
 }
 
-/** Списывает 100 просмотров при подаче заявки. */
+/** Списывает 100 просмотров со счёта клуба при подаче заявки. */
 export function spendNtFriendlyAds(db: any, teamId: string): { ok: true } | { ok: false; error: string } {
   const st = ensureNtFriendlyState(db, teamId);
   if (st.points < NT_FRIENDLY_REQUIRED_ADS) {
-    return { ok: false, error: `Для заявки нужно ${NT_FRIENDLY_REQUIRED_ADS} просмотров рекламы, набрано ${st.points}.` };
+    return { ok: false, error: `Для заявки нужно ${NT_FRIENDLY_REQUIRED_ADS} просмотров рекламы, на счёте клуба ${st.points}.` };
   }
   st.points -= NT_FRIENDLY_REQUIRED_ADS;
   st.spent += NT_FRIENDLY_REQUIRED_ADS;
   return { ok: true };
 }
 
-/** Возвращает 100 просмотров, если заявка отклонена / отозвана / истекла. */
+/** Возвращает 80 просмотров на счёт клуба, если заявка отклонена / отозвана / истекла. */
 export function refundNtFriendlyAds(db: any, teamId: string) {
   const st = ensureNtFriendlyState(db, teamId);
-  st.points += NT_FRIENDLY_REQUIRED_ADS;
-  st.spent = Math.max(0, st.spent - NT_FRIENDLY_REQUIRED_ADS);
+  st.points += NT_FRIENDLY_REFUND_ADS;
+  st.spent = Math.max(0, st.spent - NT_FRIENDLY_REFUND_ADS);
 }
 
 function fmtCooldownWords(ms: number): string {
@@ -3336,7 +3427,7 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
         }
       } else if ((NT_FRIENDLY_BLOCK_KEYS as readonly string[]).includes(blockKey)) {
         if (!actor.teamId) return ctx.fail(res, 'Реклама для матча со сборной доступна только из кабинета клуба.');
-        const ntFrCheck = checkNtFriendlyAdAllowed(db, actor.teamId);
+        const ntFrCheck = checkNtFriendlyAdAllowed(db, actor.teamId, blockKey);
         if (!ntFrCheck.ok) return ctx.fail(res, ntFrCheck.error);
       } else if (blockKey === 'interview_ask') {
         const ivCheck = checkInterviewAdAllowed(db, actor.actorKey);
@@ -4684,6 +4775,8 @@ export function registerAdsAndPredictionsRoutes(app: Express, ctx: AdServerConte
         case 'rfs_bonus': return '+€1 000';
         case 'friendly_request': return 'Заявка (9/пауза)';
         case 'friendly_accept': return 'Приём заявки';
+        case 'nt_friendly_a': return '+1 просмотр (счёт клуба)';
+        case 'nt_friendly_b': return '+1 просмотр (счёт клуба)';
         case 'coins_short': return '+1 монета';
         case 'coins_banner': return '+2 монеты';
         case 'coins_long': return '+3 монеты';
